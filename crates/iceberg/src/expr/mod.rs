@@ -26,6 +26,10 @@ pub(crate) mod visitors;
 use std::fmt::{Display, Formatter};
 
 pub use predicate::*;
+pub use visitors::expression_evaluator::ExpressionEvaluator;
+pub use visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
+pub use visitors::inclusive_projection::InclusiveProjection;
+pub use visitors::manifest_evaluator::{ManifestEvaluator, ManifestEvaluatorBuilder};
 
 use crate::spec::SchemaRef;
 

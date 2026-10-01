@@ -25,25 +25,25 @@ use crate::{Error, ErrorKind, Result};
 /// Evaluates a [`DataFile`]'s partition [`Struct`] to check
 /// if the partition tuples match the given [`BoundPredicate`].
 ///
-/// Use within [`TableScan`] to prune the list of [`DataFile`]s
+/// Use within [`crate::scan::TableScan`] to prune the list of [`DataFile`]s
 /// that could potentially match the TableScan's filter.
 #[derive(Debug)]
-pub(crate) struct ExpressionEvaluator {
+pub struct ExpressionEvaluator {
     /// The provided partition filter.
     partition_filter: BoundPredicate,
 }
 
 impl ExpressionEvaluator {
     /// Creates a new [`ExpressionEvaluator`].
-    pub(crate) fn new(partition_filter: BoundPredicate) -> Self {
+    pub fn new(partition_filter: BoundPredicate) -> Self {
         Self { partition_filter }
     }
 
     /// Evaluate this [`ExpressionEvaluator`]'s partition filter against
-    /// the provided [`DataFile`]'s partition [`Struct`]. Used by [`TableScan`]
+    /// the provided [`DataFile`]'s partition [`Struct`]. Used by [`crate::scan::TableScan`]
     /// to see if this [`DataFile`] could possibly contain data that matches
     /// the scan's filter.
-    pub(crate) fn eval(&self, data_file: &DataFile) -> Result<bool> {
+    pub fn eval(&self, data_file: &DataFile) -> Result<bool> {
         let mut visitor = ExpressionEvaluatorVisitor::new(data_file.partition());
 
         visit(&mut visitor, &self.partition_filter)

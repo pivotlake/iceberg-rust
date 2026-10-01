@@ -26,7 +26,11 @@ const IN_PREDICATE_LIMIT: usize = 200;
 const ROWS_MIGHT_MATCH: crate::Result<bool> = Ok(true);
 const ROWS_CANNOT_MATCH: crate::Result<bool> = Ok(false);
 
-pub(crate) struct InclusiveMetricsEvaluator<'a> {
+/// Evaluates whether a data file may contain rows matching a predicate.
+///
+/// Missing metrics are treated conservatively. A `false` result proves the
+/// file cannot match; `true` does not guarantee a matching row.
+pub struct InclusiveMetricsEvaluator<'a> {
     data_file: &'a DataFile,
 }
 
@@ -36,10 +40,10 @@ impl<'a> InclusiveMetricsEvaluator<'a> {
     }
 
     /// Evaluate this `InclusiveMetricsEvaluator`'s filter predicate against the
-    /// provided [`DataFile`]'s metrics. Used by [`TableScan`] to
-    /// see if this `DataFile` contains data that could match
-    /// the scan's filter.
-    pub(crate) fn eval(
+    /// provided [`DataFile`]'s metrics. Rewrite NOT operators with
+    /// [`crate::expr::Predicate::rewrite_not`] before binding the filter.
+    /// Empty files are excluded unless `include_empty_files` is set.
+    pub fn eval(
         filter: &'a BoundPredicate,
         data_file: &'a DataFile,
         include_empty_files: bool,

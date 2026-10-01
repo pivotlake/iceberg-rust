@@ -25,14 +25,14 @@ use crate::{Error, ErrorKind, Result};
 
 /// Builder for [`ManifestEvaluator`] with optional NOT rewriting capability.
 #[derive(Debug)]
-pub(crate) struct ManifestEvaluatorBuilder {
+pub struct ManifestEvaluatorBuilder {
     partition_filter: BoundPredicate,
     rewrite_not: bool,
 }
 
 impl ManifestEvaluatorBuilder {
     /// Creates a new `ManifestEvaluatorBuilder` with the given partition filter.
-    pub(crate) fn new(partition_filter: BoundPredicate) -> Self {
+    pub fn new(partition_filter: BoundPredicate) -> Self {
         Self {
             partition_filter,
             rewrite_not: false,
@@ -43,13 +43,13 @@ impl ManifestEvaluatorBuilder {
     /// When enabled, the builder will apply NOT elimination to simplify the predicate
     /// before creating the evaluator.
     #[allow(unused)]
-    pub(crate) fn with_rewrite_not(mut self, rewrite_not: bool) -> Self {
+    pub fn with_rewrite_not(mut self, rewrite_not: bool) -> Self {
         self.rewrite_not = rewrite_not;
         self
     }
 
     /// Builds the `ManifestEvaluator` with the configured options.
-    pub(crate) fn build(self) -> ManifestEvaluator {
+    pub fn build(self) -> ManifestEvaluator {
         let partition_filter = if self.rewrite_not {
             self.partition_filter.rewrite_not()
         } else {
@@ -63,24 +63,24 @@ impl ManifestEvaluatorBuilder {
 /// Evaluates a [`ManifestFile`] to see if the partition summaries
 /// match a provided [`BoundPredicate`].
 ///
-/// Used by [`TableScan`] to prune the list of [`ManifestFile`]s
+/// Used by [`crate::scan::TableScan`] to prune the list of [`ManifestFile`]s
 /// in which data might be found that matches the TableScan's filter.
 #[derive(Debug)]
-pub(crate) struct ManifestEvaluator {
+pub struct ManifestEvaluator {
     partition_filter: BoundPredicate,
 }
 
 impl ManifestEvaluator {
     /// Creates a new `ManifestEvaluatorBuilder` for building a `ManifestEvaluator`.
-    pub(crate) fn builder(partition_filter: BoundPredicate) -> ManifestEvaluatorBuilder {
+    pub fn builder(partition_filter: BoundPredicate) -> ManifestEvaluatorBuilder {
         ManifestEvaluatorBuilder::new(partition_filter)
     }
 
     /// Evaluate this `ManifestEvaluator`'s filter predicate against the
-    /// provided [`ManifestFile`]'s partitions. Used by [`TableScan`] to
+    /// provided [`ManifestFile`]'s partitions. Used by [`crate::scan::TableScan`] to
     /// see if this `ManifestFile` could possibly contain data that matches
     /// the scan's filter.
-    pub(crate) fn eval(&self, manifest_file: &ManifestFile) -> Result<bool> {
+    pub fn eval(&self, manifest_file: &ManifestFile) -> Result<bool> {
         match &manifest_file.partitions {
             Some(p) if !p.is_empty() => {
                 let mut evaluator = ManifestFilterVisitor::new(p);
