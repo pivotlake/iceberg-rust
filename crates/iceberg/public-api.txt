@@ -174,6 +174,28 @@ impl serde_core::ser::Serialize for iceberg::compression::CompressionCodec
 pub fn iceberg::compression::CompressionCodec::serialize<S: serde_core::ser::Serializer>(&self, serializer: S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::compression::CompressionCodec
 pub fn iceberg::compression::CompressionCodec::deserialize<D: serde_core::de::Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+pub mod iceberg::delete_vector
+pub struct iceberg::delete_vector::DeleteVector
+impl iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::deserialize(blob: &[u8]) -> iceberg::Result<Self>
+pub fn iceberg::delete_vector::DeleteVector::insert(&mut self, pos: u64) -> bool
+pub fn iceberg::delete_vector::DeleteVector::insert_positions(&mut self, positions: &[u64]) -> iceberg::Result<usize>
+pub fn iceberg::delete_vector::DeleteVector::is_empty(&self) -> bool
+pub fn iceberg::delete_vector::DeleteVector::iter(&self) -> iceberg::delete_vector::DeleteVectorIterator<'_>
+pub fn iceberg::delete_vector::DeleteVector::len(&self) -> u64
+pub fn iceberg::delete_vector::DeleteVector::new(roaring_treemap: roaring::treemap::RoaringTreemap) -> iceberg::delete_vector::DeleteVector
+impl core::default::Default for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::default() -> iceberg::delete_vector::DeleteVector
+impl core::fmt::Debug for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::bit::BitOrAssign for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitor_assign(&mut self, other: Self)
+pub struct iceberg::delete_vector::DeleteVectorIterator<'a>
+impl iceberg::delete_vector::DeleteVectorIterator<'_>
+pub fn iceberg::delete_vector::DeleteVectorIterator<'_>::advance_to(&mut self, pos: u64)
+impl core::iter::traits::iterator::Iterator for iceberg::delete_vector::DeleteVectorIterator<'_>
+pub type iceberg::delete_vector::DeleteVectorIterator<'_>::Item = u64
+pub fn iceberg::delete_vector::DeleteVectorIterator<'_>::next(&mut self) -> core::option::Option<Self::Item>
 pub mod iceberg::encryption
 pub mod iceberg::encryption::kms
 pub struct iceberg::encryption::kms::GeneratedKey
