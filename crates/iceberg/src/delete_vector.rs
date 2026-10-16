@@ -81,6 +81,12 @@ impl DeleteVector {
         Ok(positions.len())
     }
 
+    /// The deleted positions as the [`RoaringTreemap`] holding them, for a
+    /// reader that keeps the bitmap rather than walking its positions.
+    pub fn into_treemap(self) -> RoaringTreemap {
+        self.inner
+    }
+
     /// How many positions are deleted.
     pub fn len(&self) -> u64 {
         self.inner.len()
