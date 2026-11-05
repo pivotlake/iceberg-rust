@@ -42,6 +42,7 @@ pub struct TableBuilder {
     readonly: bool,
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
+    object_cache: Option<Arc<ObjectCache>>,
     runtime: Option<Runtime>,
 }
 
@@ -56,6 +57,7 @@ impl TableBuilder {
             readonly: false,
             disable_cache: false,
             cache_size_bytes: None,
+            object_cache: None,
             runtime: None,
         }
     }
@@ -104,6 +106,15 @@ impl TableBuilder {
         self
     }
 
+    /// optional - share `object_cache` with other tables instead of building
+    /// a cache for this table alone. Takes precedence over
+    /// [`disable_cache`](Self::disable_cache) and
+    /// [`cache_size_bytes`](Self::cache_size_bytes).
+    pub fn object_cache(mut self, object_cache: Arc<ObjectCache>) -> Self {
+        self.object_cache = Some(object_cache);
+        self
+    }
+
     /// Set the Runtime for this table to use when spawning tasks.
     pub fn runtime(mut self, runtime: Runtime) -> Self {
         self.runtime = Some(runtime);
@@ -131,6 +142,7 @@ impl TableBuilder {
             readonly,
             disable_cache,
             cache_size_bytes,
+            object_cache,
             runtime,
         } = self;
 
@@ -165,22 +177,14 @@ impl TableBuilder {
         let encryption_manager =
             EncryptionManager::from_table_metadata(kms_client.as_ref(), &metadata)?;
 
-        let object_cache = if disable_cache {
-            Arc::new(ObjectCache::with_disabled_cache(
-                file_io.clone(),
-                encryption_manager.clone(),
-            ))
+        let object_cache = if let Some(object_cache) = object_cache {
+            object_cache
+        } else if disable_cache {
+            Arc::new(ObjectCache::with_disabled_cache())
         } else if let Some(cache_size_bytes) = cache_size_bytes {
-            Arc::new(ObjectCache::new_with_capacity(
-                file_io.clone(),
-                cache_size_bytes,
-                encryption_manager.clone(),
-            ))
+            Arc::new(ObjectCache::new_with_capacity(cache_size_bytes))
         } else {
-            Arc::new(ObjectCache::new(
-                file_io.clone(),
-                encryption_manager.clone(),
-            ))
+            Arc::new(ObjectCache::new())
         };
 
         Ok(Table {
@@ -219,6 +223,21 @@ impl Table {
     /// Sets the [`Table`] metadata location and returns an updated instance.
     pub(crate) fn with_metadata_location(mut self, metadata_location: String) -> Self {
         self.metadata_location = Some(metadata_location);
+        self
+    }
+
+    /// Returns an updated instance reading its files through `file_io`
+    /// instead of the one it was built with. The manifests already cached
+    /// stay cached: a cache is not bound to a file IO.
+    pub fn with_file_io(mut self, file_io: FileIO) -> Self {
+        self.file_io = file_io;
+        self
+    }
+
+    /// Returns an updated instance caching its manifests and manifest lists
+    /// in `object_cache`, which other tables may share.
+    pub fn with_object_cache(mut self, object_cache: Arc<ObjectCache>) -> Self {
+        self.object_cache = object_cache;
         self
     }
 
@@ -262,8 +281,9 @@ impl Table {
         &self.file_io
     }
 
-    /// Returns this table's object cache
-    pub(crate) fn object_cache(&self) -> Arc<ObjectCache> {
+    /// Returns this table's object cache: the manifests and manifest lists
+    /// read through it are parsed once and served from memory after.
+    pub fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()
     }
 
@@ -550,7 +570,12 @@ mod tests {
         let snapshot_ref = table.metadata().current_snapshot().unwrap();
         let manifest_list = table
             .object_cache()
-            .get_manifest_list(snapshot_ref, &table.metadata_ref())
+            .get_manifest_list(
+                snapshot_ref,
+                &table.metadata_ref(),
+                table.file_io(),
+                table.encryption_manager().cloned(),
+            )
             .await
             .unwrap();
         assert_eq!(manifest_list.entries().len(), 0);

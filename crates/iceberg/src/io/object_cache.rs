@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::encryption::EncryptionManager;
 use crate::io::FileIO;
 use crate::spec::{
-    FormatVersion, Manifest, ManifestFile, ManifestList, ManifestListReader, ManifestReader,
-    SchemaId, SnapshotRef, TableMetadataRef,
+    FieldSummary, FormatVersion, Manifest, ManifestEntry, ManifestFile, ManifestList,
+    ManifestListReader, ManifestReader, PrimitiveLiteral, SchemaId, SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -44,66 +44,70 @@ pub(crate) enum CachedObjectKey {
     Manifest((String, Option<u64>)),
 }
 
-/// Caches metadata objects deserialized from immutable files
+/// Caches metadata objects deserialized from immutable files.
+///
+/// A cache holds no file IO of its own: a lookup reads a miss through the
+/// [`FileIO`] it is given, so one cache can serve every table of a process,
+/// tables whose file IO carry different credentials included. A table builds
+/// a cache of its own unless given one to share
+/// ([`TableBuilder::object_cache`](crate::table::TableBuilder::object_cache)).
+///
+/// The capacity is in bytes of parsed objects: an object weighs what its
+/// parsed form holds, estimated from its entries, their paths, partition
+/// values, bounds and counts.
 #[derive(Clone, Debug)]
 pub struct ObjectCache {
     cache: moka::future::Cache<CachedObjectKey, CachedItem>,
-    file_io: FileIO,
     cache_disabled: bool,
-    encryption_manager: Option<Arc<EncryptionManager>>,
+}
+
+impl Default for ObjectCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ObjectCache {
     /// Creates a new [`ObjectCache`]
     /// with the default cache size
-    pub(crate) fn new(file_io: FileIO, encryption_manager: Option<Arc<EncryptionManager>>) -> Self {
-        Self::new_with_capacity(file_io, DEFAULT_CACHE_SIZE_BYTES, encryption_manager)
+    pub fn new() -> Self {
+        Self::new_with_capacity(DEFAULT_CACHE_SIZE_BYTES)
     }
 
-    /// Creates a new [`ObjectCache`]
-    /// with a specific cache size
-    pub(crate) fn new_with_capacity(
-        file_io: FileIO,
-        cache_size_bytes: u64,
-        encryption_manager: Option<Arc<EncryptionManager>>,
-    ) -> Self {
+    /// Creates a new [`ObjectCache`] holding at most `cache_size_bytes` of
+    /// parsed objects. A capacity of zero disables caching.
+    pub fn new_with_capacity(cache_size_bytes: u64) -> Self {
         if cache_size_bytes == 0 {
-            Self::with_disabled_cache(file_io, encryption_manager)
+            Self::with_disabled_cache()
         } else {
             Self {
                 cache: moka::future::Cache::builder()
-                    .weigher(|_, val: &CachedItem| match val {
-                        CachedItem::ManifestList(item) => size_of_val(item.as_ref()),
-                        CachedItem::Manifest(item) => size_of_val(item.as_ref()),
-                    } as u32)
+                    .weigher(|_, val: &CachedItem| weigh(val))
                     .max_capacity(cache_size_bytes)
                     .build(),
-                file_io,
                 cache_disabled: false,
-                encryption_manager,
             }
         }
     }
 
     /// Creates a new [`ObjectCache`]
     /// with caching disabled
-    pub(crate) fn with_disabled_cache(
-        file_io: FileIO,
-        encryption_manager: Option<Arc<EncryptionManager>>,
-    ) -> Self {
+    pub fn with_disabled_cache() -> Self {
         Self {
             cache: moka::future::Cache::new(0),
-            file_io,
             cache_disabled: true,
-            encryption_manager,
         }
     }
 
-    /// Retrieves an Arc [`Manifest`] from the cache
-    /// or retrieves one from FileIO and parses it if not present
-    pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
+    /// Retrieves an Arc [`Manifest`] from the cache, or reads it through
+    /// `file_io` and parses it if not present
+    pub async fn get_manifest(
+        &self,
+        manifest_file: &ManifestFile,
+        file_io: &FileIO,
+    ) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
-            return ManifestReader::new(self.file_io.clone())
+            return ManifestReader::new(file_io.clone())
                 .read(manifest_file)
                 .await
                 .map(Arc::new);
@@ -117,7 +121,7 @@ impl ObjectCache {
         let cache_entry = self
             .cache
             .entry_by_ref(&key)
-            .or_try_insert_with(self.fetch_and_parse_manifest(manifest_file))
+            .or_try_insert_with(Self::fetch_and_parse_manifest(manifest_file, file_io))
             .await
             .map_err(|err| {
                 Error::new(
@@ -137,19 +141,22 @@ impl ObjectCache {
         }
     }
 
-    /// Retrieves an Arc [`ManifestList`] from the cache
-    /// or retrieves one from FileIO and parses it if not present
-    pub(crate) async fn get_manifest_list(
+    /// Retrieves an Arc [`ManifestList`] from the cache, or reads it through
+    /// `file_io` and parses it if not present, decrypting it with
+    /// `encryption_manager` when the table is encrypted
+    pub async fn get_manifest_list(
         &self,
         snapshot: &SnapshotRef,
         table_metadata: &TableMetadataRef,
+        file_io: &FileIO,
+        encryption_manager: Option<Arc<EncryptionManager>>,
     ) -> Result<Arc<ManifestList>> {
         if self.cache_disabled {
             return ManifestListReader::new(
                 snapshot.clone(),
-                self.file_io.clone(),
+                file_io.clone(),
                 table_metadata.clone(),
-                self.encryption_manager.clone(),
+                encryption_manager,
             )
             .load()
             .await
@@ -164,7 +171,12 @@ impl ObjectCache {
         let cache_entry = self
             .cache
             .entry_by_ref(&key)
-            .or_try_insert_with(self.fetch_and_parse_manifest_list(snapshot, table_metadata))
+            .or_try_insert_with(Self::fetch_and_parse_manifest_list(
+                snapshot,
+                table_metadata,
+                file_io,
+                encryption_manager,
+            ))
             .await
             .map_err(|err| {
                 Arc::try_unwrap(err).unwrap_or_else(|err| {
@@ -186,8 +198,11 @@ impl ObjectCache {
         }
     }
 
-    async fn fetch_and_parse_manifest(&self, manifest_file: &ManifestFile) -> Result<CachedItem> {
-        let manifest = ManifestReader::new(self.file_io.clone())
+    async fn fetch_and_parse_manifest(
+        manifest_file: &ManifestFile,
+        file_io: &FileIO,
+    ) -> Result<CachedItem> {
+        let manifest = ManifestReader::new(file_io.clone())
             .read(manifest_file)
             .await?;
 
@@ -195,20 +210,106 @@ impl ObjectCache {
     }
 
     async fn fetch_and_parse_manifest_list(
-        &self,
         snapshot: &SnapshotRef,
         table_metadata: &TableMetadataRef,
+        file_io: &FileIO,
+        encryption_manager: Option<Arc<EncryptionManager>>,
     ) -> Result<CachedItem> {
         let manifest_list = ManifestListReader::new(
             snapshot.clone(),
-            self.file_io.clone(),
+            file_io.clone(),
             table_metadata.clone(),
-            self.encryption_manager.clone(),
+            encryption_manager,
         )
         .load()
         .await?;
 
         Ok(CachedItem::ManifestList(Arc::new(manifest_list)))
+    }
+}
+
+/// What a map entry costs beyond its key and value: the table's control
+/// bytes and the slack of its load factor, taken as the entry over again.
+const MAP_ENTRY_SLACK_FACTOR: usize = 2;
+
+/// The weight of a cached object: the bytes its parsed form holds, estimated,
+/// saturated at the weigher's range.
+fn weigh(item: &CachedItem) -> u32 {
+    let bytes = match item {
+        CachedItem::ManifestList(list) => estimate_manifest_list_size(list),
+        CachedItem::Manifest(manifest) => estimate_manifest_size(manifest),
+    };
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
+
+fn estimate_manifest_list_size(list: &ManifestList) -> usize {
+    size_of::<ManifestList>()
+        + list
+            .entries()
+            .iter()
+            .map(estimate_manifest_file_size)
+            .sum::<usize>()
+}
+
+fn estimate_manifest_file_size(file: &ManifestFile) -> usize {
+    let summaries = file.partitions.as_deref().unwrap_or_default();
+    size_of::<ManifestFile>()
+        + file.manifest_path.len()
+        + summaries
+            .iter()
+            .map(|summary| {
+                size_of::<FieldSummary>()
+                    + summary.lower_bound.as_ref().map_or(0, |bound| bound.len())
+                    + summary.upper_bound.as_ref().map_or(0, |bound| bound.len())
+            })
+            .sum::<usize>()
+        + file.key_metadata.as_ref().map_or(0, Vec::len)
+}
+
+fn estimate_manifest_size(manifest: &Manifest) -> usize {
+    size_of::<Manifest>()
+        + manifest
+            .entries()
+            .iter()
+            .map(|entry| estimate_manifest_entry_size(entry))
+            .sum::<usize>()
+}
+
+fn estimate_manifest_entry_size(entry: &ManifestEntry) -> usize {
+    let data_file = entry.data_file();
+    let counts = data_file.column_sizes().len()
+        + data_file.value_counts().len()
+        + data_file.null_value_counts().len()
+        + data_file.nan_value_counts().len();
+    let bounds = data_file
+        .lower_bounds()
+        .values()
+        .chain(data_file.upper_bounds().values())
+        .map(|bound| {
+            size_of::<(i32, crate::spec::Datum)>() * MAP_ENTRY_SLACK_FACTOR
+                + estimate_literal_heap_size(bound.literal())
+        })
+        .sum::<usize>();
+    size_of::<ManifestEntry>()
+        + data_file.file_path().len()
+        + size_of_val(data_file.partition().fields())
+        + counts * size_of::<(i32, u64)>() * MAP_ENTRY_SLACK_FACTOR
+        + bounds
+        + data_file.key_metadata().map_or(0, <[u8]>::len)
+        + data_file.split_offsets().map_or(0, size_of_val)
+        + data_file
+            .equality_ids()
+            .map_or(0, |ids| ids.len() * size_of::<i32>())
+        + data_file
+            .referenced_data_file()
+            .map_or(0, |path| path.len())
+}
+
+fn estimate_literal_heap_size(literal: &PrimitiveLiteral) -> usize {
+    match literal {
+        PrimitiveLiteral::String(string) => string.len(),
+        PrimitiveLiteral::Binary(bytes) => bytes.len(),
+        _ => 0,
     }
 }
 
@@ -354,12 +455,14 @@ mod tests {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;
 
-        let object_cache = ObjectCache::with_disabled_cache(fixture.table.file_io().clone(), None);
+        let object_cache = ObjectCache::with_disabled_cache();
 
         let result_manifest_list = object_cache
             .get_manifest_list(
                 fixture.table.metadata().current_snapshot().unwrap(),
                 &fixture.table.metadata_ref(),
+                fixture.table.file_io(),
+                None,
             )
             .await
             .unwrap();
@@ -367,7 +470,10 @@ mod tests {
         assert_eq!(result_manifest_list.entries().len(), 1);
 
         let manifest_file = result_manifest_list.entries().first().unwrap();
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, fixture.table.file_io())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -387,13 +493,15 @@ mod tests {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;
 
-        let object_cache = ObjectCache::new(fixture.table.file_io().clone(), None);
+        let object_cache = ObjectCache::new();
 
         // not in cache
         let result_manifest_list = object_cache
             .get_manifest_list(
                 fixture.table.metadata().current_snapshot().unwrap(),
                 &fixture.table.metadata_ref(),
+                fixture.table.file_io(),
+                None,
             )
             .await
             .unwrap();
@@ -405,6 +513,8 @@ mod tests {
             .get_manifest_list(
                 fixture.table.metadata().current_snapshot().unwrap(),
                 &fixture.table.metadata_ref(),
+                fixture.table.file_io(),
+                None,
             )
             .await
             .unwrap();
@@ -414,7 +524,10 @@ mod tests {
         let manifest_file = result_manifest_list.entries().first().unwrap();
 
         // not in cache
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, fixture.table.file_io())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -429,7 +542,10 @@ mod tests {
         );
 
         // retrieve cached version
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, fixture.table.file_io())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -442,6 +558,56 @@ mod tests {
                 .unwrap(),
             "1.parquet"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cache_shared_between_tables_serves_one_tables_load_to_another() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let shared = Arc::new(ObjectCache::new());
+        let first = fixture.table.clone().with_object_cache(shared.clone());
+        let second = fixture.table.clone().with_object_cache(shared.clone());
+        let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+
+        let loaded_by_first = first
+            .object_cache()
+            .get_manifest_list(snapshot, &first.metadata_ref(), first.file_io(), None)
+            .await
+            .unwrap();
+        let served_to_second = second
+            .object_cache()
+            .get_manifest_list(snapshot, &second.metadata_ref(), second.file_io(), None)
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&loaded_by_first, &served_to_second));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_weighs_its_entries() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let object_cache = ObjectCache::new();
+        let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+        let manifest_list = object_cache
+            .get_manifest_list(
+                snapshot,
+                &fixture.table.metadata_ref(),
+                fixture.table.file_io(),
+                None,
+            )
+            .await
+            .unwrap();
+        let manifest = object_cache
+            .get_manifest(&manifest_list.entries()[0], fixture.table.file_io())
+            .await
+            .unwrap();
+
+        let weight = weigh(&CachedItem::Manifest(manifest.clone()));
+
+        let entry = manifest.entries()[0].data_file();
+        let at_least = size_of::<Manifest>() + size_of::<ManifestEntry>() + entry.file_path().len();
+        assert!(weight as usize >= at_least, "{weight} < {at_least}");
     }
 
     #[tokio::test]
@@ -496,10 +662,16 @@ mod tests {
         let mut manifest_file_b = manifest_file;
         manifest_file_b.first_row_id = Some(2000);
 
-        let object_cache = ObjectCache::new(io, None);
+        let object_cache = ObjectCache::new();
 
-        let manifest_a = object_cache.get_manifest(&manifest_file_a).await.unwrap();
-        let manifest_b = object_cache.get_manifest(&manifest_file_b).await.unwrap();
+        let manifest_a = object_cache
+            .get_manifest(&manifest_file_a, &io)
+            .await
+            .unwrap();
+        let manifest_b = object_cache
+            .get_manifest(&manifest_file_b, &io)
+            .await
+            .unwrap();
 
         // A cache keyed on path alone would serve manifest_a's inherited ids for
         // the second read; keying on first_row_id keeps them distinct.

@@ -21,7 +21,9 @@ use futures::channel::mpsc::Sender;
 use futures::{SinkExt, TryFutureExt};
 
 use crate::delete_file_index::DeleteFileIndex;
+use crate::encryption::EncryptionManager;
 use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::{
     BoundPredicates, ExpressionEvaluatorCache, FileScanTask, ManifestEvaluatorCache,
@@ -43,6 +45,7 @@ pub(crate) struct ManifestFileContext {
     field_ids: Arc<Vec<i32>>,
     bound_predicates: Option<Arc<BoundPredicates>>,
     object_cache: Arc<ObjectCache>,
+    file_io: FileIO,
     snapshot_schema: SchemaRef,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     delete_file_index: DeleteFileIndex,
@@ -75,6 +78,7 @@ impl ManifestFileContext {
     pub(crate) async fn fetch_manifest_and_stream_manifest_entries(self) -> Result<()> {
         let ManifestFileContext {
             object_cache,
+            file_io,
             manifest_file,
             bound_predicates,
             snapshot_schema,
@@ -88,7 +92,7 @@ impl ManifestFileContext {
             unified_partition_type,
         } = self;
 
-        let manifest = object_cache.get_manifest(&manifest_file).await?;
+        let manifest = object_cache.get_manifest(&manifest_file, &file_io).await?;
 
         for manifest_entry in manifest.entries() {
             let manifest_entry_context = ManifestEntryContext {
@@ -166,6 +170,8 @@ pub(crate) struct PlanContext {
     pub predicate: Option<Arc<Predicate>>,
     pub snapshot_bound_predicate: Option<Arc<BoundPredicate>>,
     pub object_cache: Arc<ObjectCache>,
+    pub file_io: FileIO,
+    pub encryption_manager: Option<Arc<EncryptionManager>>,
     pub field_ids: Arc<Vec<i32>>,
     pub name_mapping: Option<Arc<NameMapping>>,
 
@@ -180,7 +186,12 @@ impl PlanContext {
     pub(crate) async fn get_manifest_list(&self) -> Result<Arc<ManifestList>> {
         self.object_cache
             .as_ref()
-            .get_manifest_list(&self.snapshot, &self.table_metadata)
+            .get_manifest_list(
+                &self.snapshot,
+                &self.table_metadata,
+                &self.file_io,
+                self.encryption_manager.clone(),
+            )
             .await
     }
 
@@ -293,6 +304,7 @@ impl PlanContext {
             bound_predicates,
             sender,
             object_cache: self.object_cache.clone(),
+            file_io: self.file_io.clone(),
             snapshot_schema: self.snapshot_schema.clone(),
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
