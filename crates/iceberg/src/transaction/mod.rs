@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod manifest_merge;
 mod merging;
 mod rewrite;
 mod snapshot;
@@ -266,8 +267,8 @@ mod tests {
     use crate::io::FileIO;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct, TableMetadata,
-        TableProperties,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, ManifestEntryRef,
+        ManifestFile, Struct, TableMetadata, TableProperties,
     };
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
@@ -297,6 +298,76 @@ mod tests {
         let tx = Transaction::new(table);
         let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
         tx.commit(catalog).await.unwrap()
+    }
+
+    /// Append data files to a table via a fast_append that merges manifests
+    /// and return the updated table.
+    pub(crate) async fn append_files_merging_manifests(
+        catalog: &impl Catalog,
+        table: &Table,
+        files: Vec<DataFile>,
+    ) -> Table {
+        let tx = Transaction::new(table);
+        let action = tx
+            .fast_append()
+            .with_manifest_merge(true)
+            .add_data_files(files);
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog).await.unwrap()
+    }
+
+    /// Set table properties and return the updated table.
+    pub(crate) async fn set_table_properties(
+        catalog: &impl Catalog,
+        table: &Table,
+        properties: &[(&str, &str)],
+    ) -> Table {
+        let tx = Transaction::new(table);
+        let mut action = tx.update_table_properties();
+        for (key, value) in properties {
+            action = action.set(key.to_string(), value.to_string());
+        }
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog).await.unwrap()
+    }
+
+    /// The manifests the table's current snapshot lists, in order.
+    pub(crate) async fn load_current_manifests(table: &Table) -> Vec<ManifestFile> {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        manifest_list.entries().to_vec()
+    }
+
+    /// Every entry of the manifests the table's current snapshot lists.
+    pub(crate) async fn load_current_entries(table: &Table) -> Vec<ManifestEntryRef> {
+        let mut entries = Vec::new();
+        for manifest_file in load_current_manifests(table).await {
+            let manifest = table.manifest_reader().read(&manifest_file).await.unwrap();
+            entries.extend(manifest.entries().iter().cloned());
+        }
+        entries
+    }
+
+    /// The paths of the live files among `entries`, sorted.
+    pub(crate) fn collect_live_paths(entries: &[ManifestEntryRef]) -> Vec<&str> {
+        let mut paths: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.is_alive())
+            .map(|entry| entry.file_path())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// The entry for `path` among `entries`.
+    pub(crate) fn find_entry_by_path<'a>(
+        entries: &'a [ManifestEntryRef],
+        path: &str,
+    ) -> &'a ManifestEntryRef {
+        entries
+            .iter()
+            .find(|entry| entry.file_path() == path)
+            .unwrap()
     }
 
     pub fn make_v1_table() -> Table {

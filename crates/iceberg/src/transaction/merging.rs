@@ -36,11 +36,12 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
+use crate::transaction::manifest_merge::ManifestMergeManager;
 use crate::transaction::snapshot::SnapshotProducer;
 use crate::{Error, ErrorKind};
 
 /// Create a manifest writer that handles encryption when available.
-fn new_manifest_writer(
+pub(crate) fn new_manifest_writer(
     table: &Table,
     output_file: OutputFile,
     snapshot_id: Option<i64>,
@@ -179,15 +180,6 @@ impl ManifestFilterManager {
                             ),
                         )
                     })?;
-                    let file_seq = entry.file_sequence_number.ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Manifest entry for {} is missing file_sequence_number",
-                                entry.file_path()
-                            ),
-                        )
-                    })?;
                     let existing = ManifestEntry::builder()
                         .status(ManifestStatus::Existing)
                         .snapshot_id(
@@ -196,7 +188,7 @@ impl ManifestFilterManager {
                                 .unwrap_or(manifest_file.added_snapshot_id),
                         )
                         .sequence_number(seq)
-                        .file_sequence_number(file_seq)
+                        .file_sequence_number_opt(entry.file_sequence_number)
                         .data_file(entry.data_file().clone())
                         .build();
                     surviving_entries.push(existing);
@@ -284,6 +276,11 @@ pub(crate) struct MergingSnapshotProducer {
     filter_manager: ManifestFilterManager,
     commit_uuid: Uuid,
     data_sequence_number: Option<i64>,
+    /// Whether added files are checked against the files the table already
+    /// references, which reads every data manifest.
+    check_duplicate: bool,
+    /// Whether small data manifests are merged, see [`ManifestMergeManager`].
+    manifest_merge: bool,
     /// Names the manifests this producer writes. It is never reset, so a
     /// commit retry cannot overwrite a manifest an earlier attempt wrote
     /// under the same commit uuid.
@@ -299,6 +296,8 @@ impl MergingSnapshotProducer {
             filter_manager: ManifestFilterManager::new(true),
             commit_uuid: Uuid::now_v7(),
             data_sequence_number: None,
+            check_duplicate: true,
+            manifest_merge: false,
             manifest_counter: AtomicU64::new(0),
         }
     }
@@ -309,6 +308,14 @@ impl MergingSnapshotProducer {
 
     pub(crate) fn set_data_sequence_number(&mut self, sequence_number: i64) {
         self.data_sequence_number = Some(sequence_number);
+    }
+
+    pub(crate) fn set_check_duplicate(&mut self, check_duplicate: bool) {
+        self.check_duplicate = check_duplicate;
+    }
+
+    pub(crate) fn set_manifest_merge(&mut self, manifest_merge: bool) {
+        self.manifest_merge = manifest_merge;
     }
 
     pub(crate) fn delete_data_file(&mut self, file: DataFile) {
@@ -354,7 +361,9 @@ impl MergingSnapshotProducer {
             self.added_data_files.clone(),
         );
         snapshot_producer.validate_added_data_files()?;
-        snapshot_producer.validate_duplicate_files().await?;
+        if self.check_duplicate {
+            snapshot_producer.validate_duplicate_files().await?;
+        }
         let snapshot_id = snapshot_producer.snapshot_id;
 
         // 1. Load existing manifests from the current snapshot.
@@ -385,35 +394,49 @@ impl MergingSnapshotProducer {
             .await?;
 
         // 3. Write a new manifest for added files.
+        let mut added_manifests = Vec::new();
         if !self.added_data_files.is_empty() {
-            let added_manifest = self
-                .write_added_manifest(table, snapshot_id, &self.manifest_counter)
-                .await?;
-            filtered_manifests.push(added_manifest);
+            added_manifests.push(self.write_added_manifest(table, snapshot_id).await?);
         }
 
-        // 4. Compute summary (added + removed).
+        // 4. Merge small data manifests, or list the added manifest last.
+        let manifests = if self.manifest_merge {
+            ManifestMergeManager::try_from_table(table)?
+                .merge_manifests(
+                    table,
+                    snapshot_id,
+                    added_manifests,
+                    filtered_manifests,
+                    || self.generate_manifest_file_path(table),
+                )
+                .await?
+        } else {
+            filtered_manifests.extend(added_manifests);
+            filtered_manifests
+        };
+
+        // 5. Compute summary (added + removed).
         let summary = self.build_summary(table, removed_collector)?;
 
-        // 5. Delegate to SnapshotProducer for manifest list + snapshot creation.
+        // 6. Delegate to SnapshotProducer for manifest list + snapshot creation.
         snapshot_producer
-            .commit_with_manifests(filtered_manifests, summary)
+            .commit_with_manifests(manifests, summary)
             .await
     }
 
-    async fn write_added_manifest(
-        &self,
-        table: &Table,
-        snapshot_id: i64,
-        manifest_counter: &AtomicU64,
-    ) -> Result<ManifestFile> {
-        let new_manifest_path = format!(
+    /// The path of the next manifest this producer writes.
+    fn generate_manifest_file_path(&self, table: &Table) -> Result<String> {
+        Ok(format!(
             "{}/{}-m{}.{}",
             table.metadata().metadata_location()?,
             self.commit_uuid,
-            manifest_counter.fetch_add(1, Ordering::Relaxed),
+            self.manifest_counter.fetch_add(1, Ordering::Relaxed),
             DataFileFormat::Avro,
-        );
+        ))
+    }
+
+    async fn write_added_manifest(&self, table: &Table, snapshot_id: i64) -> Result<ManifestFile> {
+        let new_manifest_path = self.generate_manifest_file_path(table)?;
         let output_file = table.file_io().new_output(new_manifest_path)?;
         let schema = table.metadata().current_schema().clone();
         let partition_spec = table.metadata().default_partition_spec().as_ref().clone();

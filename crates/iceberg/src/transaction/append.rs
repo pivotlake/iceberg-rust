@@ -25,13 +25,14 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, MergeManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
 /// FastAppendAction is a transaction action for fast append data files to the table.
 pub struct FastAppendAction {
     check_duplicate: bool,
+    manifest_merge: bool,
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
@@ -42,6 +43,7 @@ impl FastAppendAction {
     pub(crate) fn new() -> Self {
         Self {
             check_duplicate: true,
+            manifest_merge: false,
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
@@ -51,6 +53,26 @@ impl FastAppendAction {
     /// Set whether to check duplicate files
     pub fn with_check_duplicate(mut self, v: bool) -> Self {
         self.check_duplicate = v;
+        self
+    }
+
+    /// Set whether to merge small data manifests while committing. Off by
+    /// default: the append then lists every existing manifest as it is,
+    /// followed by the one it writes.
+    ///
+    /// When on, and unless the table property `commit.manifest-merge.enabled`
+    /// is `false`, the snapshot lists the manifest this append writes first,
+    /// then the existing data manifests that still hold a live file, then the
+    /// delete manifests. The data manifests of each partition spec are
+    /// bin-packed by length, starting from the last one, up to
+    /// `commit.manifest.target-size-bytes` (8 MB by default), and every bin of
+    /// several manifests is rewritten as one; the bin holding the first
+    /// manifest is only rewritten once it has
+    /// `commit.manifest.min-count-to-merge` manifests (100 by default). A
+    /// rewritten manifest carries its files as existing entries with the
+    /// snapshot id, sequence numbers and `first_row_id` they had.
+    pub fn with_manifest_merge(mut self, v: bool) -> Self {
+        self.manifest_merge = v;
         self
     }
 
@@ -103,9 +125,15 @@ impl TransactionAction for FastAppendAction {
             snapshot_producer.validate_duplicate_files().await?;
         }
 
-        snapshot_producer
-            .commit(FastAppendOperation, DefaultManifestProcess)
-            .await
+        if self.manifest_merge {
+            snapshot_producer
+                .commit(FastAppendOperation, MergeManifestProcess)
+                .await
+        } else {
+            snapshot_producer
+                .commit(FastAppendOperation, DefaultManifestProcess)
+                .await
+        }
     }
 }
 

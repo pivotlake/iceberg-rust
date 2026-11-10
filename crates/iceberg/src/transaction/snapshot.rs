@@ -32,6 +32,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
+use crate::transaction::manifest_merge::ManifestMergeManager;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// A trait that defines how different table operations produce new snapshots.
@@ -87,24 +88,53 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
+/// A [`ManifestProcess`] that lists the manifests as they are.
 pub(crate) struct DefaultManifestProcess;
 
 impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifests(
+    async fn process_manifests(
         &self,
-        _snapshot_produce: &SnapshotProducer<'_>,
+        _snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile> {
-        manifests
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(manifests)
     }
 }
 
+/// A [`ManifestProcess`] that merges small data manifests, see
+/// [`ManifestMergeManager`].
+pub(crate) struct MergeManifestProcess;
+
+impl ManifestProcess for MergeManifestProcess {
+    async fn process_manifests(
+        &self,
+        snapshot_produce: &mut SnapshotProducer<'_>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let table = snapshot_produce.table;
+        let snapshot_id = snapshot_produce.snapshot_id;
+        let (new_manifests, carried_manifests) = manifests
+            .into_iter()
+            .partition(|manifest| manifest.added_snapshot_id == snapshot_id);
+        ManifestMergeManager::try_from_table(table)?
+            .merge_manifests(table, snapshot_id, new_manifests, carried_manifests, || {
+                snapshot_produce.generate_manifest_file_path()
+            })
+            .await
+    }
+}
+
+/// Decides which manifests the new snapshot lists, given the manifests the
+/// operation carried forward and wrote: the last step before the manifest
+/// list is written.
 pub(crate) trait ManifestProcess: Send + Sync {
+    /// Returns the manifests the new snapshot lists. May read `manifests` and
+    /// write new ones, named by `snapshot_produce`.
     fn process_manifests(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile>;
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
 pub(crate) struct SnapshotProducer<'a> {
@@ -238,14 +268,19 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_id
     }
 
-    fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
-        let new_manifest_path = format!(
+    /// The path of the next manifest this producer writes.
+    fn generate_manifest_file_path(&mut self) -> Result<String> {
+        Ok(format!(
             "{}/{}-m{}.{}",
             self.table.metadata().metadata_location()?,
             self.commit_uuid,
             self.manifest_counter.next().unwrap(),
             DataFileFormat::Avro
-        );
+        ))
+    }
+
+    fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
+        let new_manifest_path = self.generate_manifest_file_path()?;
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
         let partition_spec = self
             .table
@@ -372,8 +407,9 @@ impl<'a> SnapshotProducer<'a> {
         // # TODO
         // Support process delete entries.
 
-        let manifest_files = manifest_process.process_manifests(self, manifest_files);
-        Ok(manifest_files)
+        manifest_process
+            .process_manifests(self, manifest_files)
+            .await
     }
 
     // Returns a `Summary` of the current snapshot

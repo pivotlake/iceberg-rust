@@ -19,7 +19,7 @@ use super::Manifest;
 use crate::encryption::{EncryptedInputFile, StandardKeyMetadata};
 use crate::error::Result;
 use crate::io::FileIO;
-use crate::spec::{ManifestContentType, ManifestEntry, ManifestFile};
+use crate::spec::{ManifestContentType, ManifestEntry, ManifestFile, ManifestMetadata};
 use crate::{Error, ErrorKind};
 
 /// Reads a manifest file referenced by a manifest list entry, transparently
@@ -37,6 +37,34 @@ impl ManifestReader {
     /// Read, decrypt, parse and return the manifest described by
     /// `manifest_file`.
     pub async fn read(self, manifest_file: &ManifestFile) -> Result<Manifest> {
+        let (metadata, mut entries) = self.read_inherited_entries(manifest_file).await?;
+
+        self.assign_first_row_ids(manifest_file, &mut entries)?;
+
+        Ok(Manifest::new(metadata, entries))
+    }
+
+    /// Read a manifest written by a commit that is still in progress, whose
+    /// `manifest_file` is not yet in a manifest list.
+    ///
+    /// Such a manifest has no manifest-level `first_row_id` until the manifest
+    /// list writer assigns one, so every entry keeps the `first_row_id` it was
+    /// written with instead of having it cleared as [`Self::read`] does for a
+    /// committed manifest without one. The entries carried over from committed
+    /// manifests hold the row ids of rows that already exist.
+    pub(crate) async fn read_uncommitted(self, manifest_file: &ManifestFile) -> Result<Manifest> {
+        let (metadata, entries) = self.read_inherited_entries(manifest_file).await?;
+
+        Ok(Manifest::new(metadata, entries))
+    }
+
+    /// Read, decrypt and parse the manifest described by `manifest_file`, its
+    /// entries inheriting the snapshot id and sequence numbers of
+    /// `manifest_file`.
+    async fn read_inherited_entries(
+        &self,
+        manifest_file: &ManifestFile,
+    ) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
         let input_file = self.file_io.new_input(&manifest_file.manifest_path)?;
         let key_metadata = manifest_file
             .key_metadata
@@ -58,9 +86,7 @@ impl ManifestReader {
             entry.inherit_data(manifest_file);
         }
 
-        self.assign_first_row_ids(manifest_file, &mut entries)?;
-
-        Ok(Manifest::new(metadata, entries))
+        Ok((metadata, entries))
     }
 
     /// Assigns `first_row_id` to the live data-file entries, following the
