@@ -560,7 +560,14 @@ impl<'a> SnapshotProducer<'a> {
         let writer_next_row_id = manifest_list_writer.next_row_id();
         manifest_list_writer.close().await?;
 
-        let commit_ts = chrono::Utc::now().timestamp_millis();
+        // A snapshot is dated after its parent even when the clock is behind
+        // the one that dated the parent.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let commit_ts = self
+            .table
+            .metadata()
+            .current_snapshot()
+            .map_or(now_ms, |parent| now_ms.max(parent.timestamp_ms() + 1));
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
@@ -595,16 +602,24 @@ impl<'a> SnapshotProducer<'a> {
             })
             .unwrap_or_default();
 
+        // Moving the branch keeps the retention it was given; only a branch
+        // this commit creates starts without one.
+        let main_branch_retention = self
+            .table
+            .metadata()
+            .refs()
+            .get(MAIN_BRANCH)
+            .map_or(SnapshotRetention::branch(None, None, None), |reference| {
+                reference.retention.clone()
+            });
+
         let updates = [encryption_key_updates, vec![
             TableUpdate::AddSnapshot {
                 snapshot: new_snapshot,
             },
             TableUpdate::SetSnapshotRef {
                 ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(
-                    self.snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
+                reference: SnapshotReference::new(self.snapshot_id, main_branch_retention),
             },
         ]]
         .concat();

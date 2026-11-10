@@ -336,6 +336,13 @@ impl TableMetadata {
         self.current_snapshot_id
     }
 
+    /// Returns the snapshot references of the table, its branches and tags,
+    /// by name.
+    #[inline]
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
+    }
+
     /// Get the snapshot for a reference
     /// Returns an option if the `ref_name` is not found
     #[inline]
@@ -1642,7 +1649,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::{FormatVersion, MetadataLog, SnapshotLog, TableMetadataBuilder};
+    use super::{FormatVersion, MAIN_BRANCH, MetadataLog, SnapshotLog, TableMetadataBuilder};
     use crate::catalog::MetadataLocation;
     use crate::compression::CompressionCodec;
     use crate::io::FileIO;
@@ -1680,6 +1687,20 @@ mod tests {
             .build()
             .unwrap()
             .metadata
+    }
+
+    #[test]
+    fn test_refs_returns_the_main_branch() {
+        let metadata = get_test_table_metadata("TableMetadataV2Valid.json");
+
+        let refs = metadata.refs();
+
+        assert_eq!(refs.len(), 1);
+        assert!(refs[MAIN_BRANCH].is_branch());
+        assert_eq!(
+            Some(refs[MAIN_BRANCH].snapshot_id),
+            metadata.current_snapshot_id()
+        );
     }
 
     #[test]
