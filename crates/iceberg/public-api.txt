@@ -2824,6 +2824,7 @@ pub fn iceberg::spec::TableMetadataBuilder::remove_ref(self, ref_name: &str) -> 
 pub fn iceberg::spec::TableMetadataBuilder::remove_schemas(self, schema_id_to_remove: &[i32]) -> iceberg::Result<Self>
 pub fn iceberg::spec::TableMetadataBuilder::remove_snapshots(self, snapshot_ids: &[i64]) -> Self
 pub fn iceberg::spec::TableMetadataBuilder::remove_statistics(self, snapshot_id: i64) -> Self
+pub fn iceberg::spec::TableMetadataBuilder::retain_metadata_log_except(self, metadata_files: impl core::iter::traits::collect::IntoIterator<Item = alloc::string::String>) -> Self
 pub fn iceberg::spec::TableMetadataBuilder::set_branch_snapshot(self, snapshot: iceberg::spec::Snapshot, branch: &str) -> iceberg::Result<Self>
 pub fn iceberg::spec::TableMetadataBuilder::set_current_schema(self, schema_id: i32) -> iceberg::Result<Self>
 pub fn iceberg::spec::TableMetadataBuilder::set_default_partition_spec(self, spec_id: i32) -> iceberg::Result<Self>
