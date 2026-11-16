@@ -87,7 +87,9 @@ pub use crate::transaction::update_properties::UpdatePropertiesAction;
 pub use crate::transaction::update_schema::UpdateSchemaAction;
 pub use crate::transaction::update_statistics::UpdateStatisticsAction;
 pub use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-use crate::transaction::written_files::WrittenFiles;
+use crate::transaction::written_files::{
+    WrittenFiles, collect_unreferenced_paths, collect_written_paths,
+};
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
 
 /// Table transaction.
@@ -193,12 +195,25 @@ impl Transaction {
 
     /// Commit transaction.
     ///
-    /// The manifests and manifest lists of an attempt that did not commit are
-    /// deleted: an attempt that failed before the catalog was asked, and an
-    /// attempt the catalog rejected with
-    /// [`ErrorKind::CatalogCommitConflicts`], whether or not it is retried.
-    /// When [`Catalog::update_table`] fails with any other error the commit
-    /// may have been applied, so the files of that attempt are kept.
+    /// Every attempt writes its manifests and manifest lists before it asks
+    /// the catalog to commit. What becomes of them depends on how the attempt
+    /// ends:
+    ///
+    /// - It fails before the catalog is asked, or the catalog rejects it with
+    ///   [`ErrorKind::CatalogCommitConflicts`], whether or not it is then
+    ///   retried: every manifest and manifest list it wrote is deleted.
+    /// - [`Catalog::update_table`] fails with any other error: the commit may
+    ///   have been applied, so every file the attempt wrote is kept.
+    /// - It commits: the manifests it wrote that none of the manifest lists it
+    ///   wrote names are deleted. Those are the manifests an action wrote and
+    ///   then merged into another. Its manifest lists are kept, and so is
+    ///   every manifest named by the manifest list of any of its actions. An
+    ///   action that wrote manifests and no manifest list keeps them all.
+    ///
+    /// A file the attempt did not write is never deleted, so a manifest of an
+    /// earlier snapshot that this commit merged into another stays until the
+    /// snapshots naming it expire. A file that cannot be deleted is logged and
+    /// changes neither the table returned nor the error.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
             // nothing to commit
@@ -244,28 +259,36 @@ impl Transaction {
             self.table = refreshed.clone();
         }
 
-        let written_files = WrittenFiles::default();
+        let written_files: Vec<WrittenFiles> = self
+            .actions
+            .iter()
+            .map(|_| WrittenFiles::default())
+            .collect();
         let table_commit = match self.build_table_commit(&written_files).await {
             Ok(table_commit) => table_commit,
             Err(error) => {
                 // The catalog was never asked, so nothing can reference the
                 // files written so far.
-                self.delete_uncommitted_files(written_files.take_paths())
+                self.delete_unreferenced_files(collect_written_paths(&written_files))
                     .await;
                 return Err(error);
             }
         };
 
         match catalog.update_table(table_commit).await {
-            Ok(table) => Ok(table),
+            Ok(table) => {
+                self.delete_unreferenced_files(collect_unreferenced_paths(&written_files))
+                    .await;
+                Ok(table)
+            }
             Err(error) if is_commit_rejected(&error) => {
-                self.delete_uncommitted_files(written_files.take_paths())
+                self.delete_unreferenced_files(collect_written_paths(&written_files))
                     .await;
                 Err(error)
             }
             Err(error) => {
                 self.unknown_outcome_files
-                    .extend(written_files.take_paths());
+                    .extend(collect_written_paths(&written_files));
                 Err(error)
             }
         }
@@ -273,15 +296,16 @@ impl Transaction {
 
     /// Runs the actions on top of the transaction's table and returns the
     /// commit that carries their updates and requirements. The manifests and
-    /// manifest lists the actions write are recorded in `written_files`.
-    async fn build_table_commit(&self, written_files: &WrittenFiles) -> Result<TableCommit> {
+    /// manifest lists each action writes are recorded in its entry of
+    /// `written_files`, which has one per action.
+    async fn build_table_commit(&self, written_files: &[WrittenFiles]) -> Result<TableCommit> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
 
-        for action in &self.actions {
+        for (action, action_files) in self.actions.iter().zip(written_files) {
             let action_commit = Arc::clone(action)
-                .commit_recording_files(&current_table, written_files)
+                .commit_recording_files(&current_table, action_files)
                 .await?;
             // apply action commit to current_table
             current_table = Self::apply(
@@ -299,21 +323,23 @@ impl Transaction {
             .build())
     }
 
-    /// Deletes the files, at `paths`, of an attempt that did not commit.
+    /// Deletes the files at `paths`, which an attempt wrote and nothing
+    /// references: all the files of an attempt that did not commit, or the
+    /// manifests an attempt that committed merged into others.
     ///
     /// A path an earlier attempt of unknown outcome also wrote is kept: that
     /// attempt may have committed, and the file may be live.
-    async fn delete_uncommitted_files(&self, paths: Vec<String>) {
+    async fn delete_unreferenced_files(&self, paths: Vec<String>) {
         let file_io = self.table.file_io();
         for path in paths {
             if self.unknown_outcome_files.contains(&path) {
                 continue;
             }
             // A file that cannot be deleted stays in storage, referenced by
-            // nothing; the commit still fails with its own error.
+            // nothing; the commit ends as it would have without it.
             if let Err(error) = file_io.delete(&path).await {
                 tracing::warn!(
-                    "Failed to delete {path}, written by a commit to table {} that did not succeed: {error}",
+                    "Failed to delete {path}, written by a commit to table {} and referenced by nothing: {error}",
                     self.table.identifier()
                 );
             }
@@ -913,8 +939,11 @@ mod test_row_lineage {
 
 #[cfg(test)]
 mod test_uncommitted_files {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use uuid::Uuid;
 
     use crate::catalog::MockCatalog;
@@ -922,11 +951,14 @@ mod test_uncommitted_files {
     use crate::spec::{Snapshot, TableProperties};
     use crate::table::Table;
     use crate::transaction::tests::{
-        append_files, load_current_manifests, make_data_file, make_v2_minimal_table_in_catalog,
-        set_table_properties,
+        append_files, collect_live_paths, load_current_entries, load_current_manifests,
+        make_data_file, make_v2_minimal_table_in_catalog, set_table_properties,
     };
-    use crate::transaction::{ApplyTransactionAction, Transaction};
-    use crate::{Catalog, Error, ErrorKind, TableCommit, TableUpdate};
+    use crate::transaction::written_files::WrittenFiles;
+    use crate::transaction::{
+        ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+    };
+    use crate::{Catalog, Error, ErrorKind, Result, TableCommit, TableUpdate};
 
     /// The files each `update_table` call found written by the attempt that
     /// made it, in call order.
@@ -953,6 +985,48 @@ mod test_uncommitted_files {
             .add_data_files(vec![file])
             .apply(tx)
             .unwrap()
+    }
+
+    /// A V2 table in `catalog` holding two files in two manifests, which a
+    /// commit that merges manifests merges into one.
+    async fn make_table_with_two_manifests(catalog: &impl Catalog) -> Table {
+        let table = make_table_with_one_file(catalog, "0").await;
+        let table = set_table_properties(catalog, &table, &[(
+            TableProperties::PROPERTY_COMMIT_MANIFEST_MIN_COUNT_TO_MERGE,
+            "2",
+        )])
+        .await;
+        let file = make_data_file(&table, "test/2.parquet", 10, 100);
+        append_files(catalog, &table, vec![file]).await
+    }
+
+    /// An action that writes a manifest at `manifest_path` and no manifest
+    /// list.
+    struct WriteLoneManifestAction {
+        manifest_path: String,
+    }
+
+    #[async_trait]
+    impl TransactionAction for WriteLoneManifestAction {
+        async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+            self.commit_recording_files(table, &WrittenFiles::default())
+                .await
+        }
+
+        async fn commit_recording_files(
+            self: Arc<Self>,
+            table: &Table,
+            written_files: &WrittenFiles,
+        ) -> Result<ActionCommit> {
+            let output_file =
+                written_files.new_manifest_output(table.file_io(), self.manifest_path.clone())?;
+            output_file.write(Bytes::from_static(b"manifest")).await?;
+            let updates = HashMap::from([("test.key".to_string(), "test.value".to_string())]);
+            Ok(ActionCommit::new(
+                vec![TableUpdate::SetProperties { updates }],
+                vec![],
+            ))
+        }
     }
 
     fn make_conflict() -> Error {
@@ -990,6 +1064,18 @@ mod test_uncommitted_files {
         }
         paths.sort();
         paths.dedup();
+        paths
+    }
+
+    /// The files in storage that the attempt committing `updates` to `table`
+    /// wrote, snapshot by snapshot.
+    async fn collect_attempt_files(table: &Table, updates: &[TableUpdate]) -> Vec<String> {
+        let mut paths = Vec::new();
+        for update in updates {
+            if let TableUpdate::AddSnapshot { snapshot } = update {
+                paths.extend(collect_snapshot_files(table, snapshot).await);
+            }
+        }
         paths
     }
 
@@ -1042,12 +1128,7 @@ mod test_uncommitted_files {
                 Box::pin(async move {
                     let table = catalog.load_table(commit.identifier()).await?;
                     let updates = commit.take_updates();
-                    let mut written_files = Vec::new();
-                    for update in &updates {
-                        if let TableUpdate::AddSnapshot { snapshot } = update {
-                            written_files.extend(collect_snapshot_files(&table, snapshot).await);
-                        }
-                    }
+                    let written_files = collect_attempt_files(&table, &updates).await;
                     attempt_files.lock().unwrap().push(written_files);
                     match failure {
                         Some(error) => Err(error),
@@ -1060,6 +1141,40 @@ mod test_uncommitted_files {
                             catalog.update_table(commit).await
                         }
                     }
+                })
+            });
+
+        mock_catalog
+    }
+
+    /// A catalog serving `table`, whose `update_table` records the files of
+    /// the attempt in `attempt_files` and applies the commit to `table`
+    /// whatever the commit requires of it.
+    fn make_catalog_accepting_commits(table: &Table, attempt_files: AttemptFiles) -> MockCatalog {
+        let mut mock_catalog = MockCatalog::new();
+
+        let loaded_table = table.clone();
+        mock_catalog.expect_load_table().returning_st(move |_| {
+            let table = loaded_table.clone();
+            Box::pin(async move { Ok(table) })
+        });
+
+        let base_table = table.clone();
+        mock_catalog
+            .expect_update_table()
+            .returning_st(move |mut commit| {
+                let table = base_table.clone();
+                let attempt_files = attempt_files.clone();
+                Box::pin(async move {
+                    let updates = commit.take_updates();
+                    let written_files = collect_attempt_files(&table, &updates).await;
+                    attempt_files.lock().unwrap().push(written_files);
+                    TableCommit::builder()
+                        .ident(commit.identifier().clone())
+                        .updates(updates)
+                        .requirements(vec![])
+                        .build()
+                        .apply(table)
                 })
             });
 
@@ -1208,5 +1323,119 @@ mod test_uncommitted_files {
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
         assert!(attempt_files.lock().unwrap().is_empty());
         assert!(!table.file_io().exists(&first_manifest_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_append_merging_manifests_deletes_the_manifest_it_merged_away() {
+        let catalog = Arc::new(new_memory_catalog().await);
+        let table = make_table_with_two_manifests(catalog.as_ref()).await;
+        let table_files = collect_table_files(&table).await;
+        let attempt_files = AttemptFiles::default();
+        let recording_catalog =
+            make_catalog_failing_commits(catalog, vec![], attempt_files.clone());
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .with_manifest_merge(true)
+            .add_data_files(vec![make_data_file(&table, "test/3.parquet", 10, 100)]);
+        let tx = action.apply(tx).unwrap();
+
+        let table = tx.commit(&recording_catalog).await.unwrap();
+
+        // The attempt wrote a manifest list and two manifests: the one for the
+        // added file, and that one merged with the two the table had. The
+        // manifest list names the merged one only.
+        let attempt_files = attempt_files.lock().unwrap().clone();
+        let manifests = load_current_manifests(&table).await;
+        let entries = load_current_entries(&table).await;
+        assert_eq!(attempt_files[0].len(), 3);
+        assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 2);
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(collect_live_paths(&entries), [
+            "test/1.parquet",
+            "test/2.parquet",
+            "test/3.parquet"
+        ]);
+        assert_eq!(count_stored_files(&table, &table_files).await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_merging_manifests_deletes_the_manifests_it_merged_away() {
+        let catalog = Arc::new(new_memory_catalog().await);
+        let table = make_table_with_two_manifests(catalog.as_ref()).await;
+        let table_files = collect_table_files(&table).await;
+        let attempt_files = AttemptFiles::default();
+        let recording_catalog =
+            make_catalog_failing_commits(catalog, vec![], attempt_files.clone());
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_manifest_merge(true)
+            .delete_file(make_data_file(&table, "test/1.parquet", 10, 100))
+            .add_file(make_data_file(&table, "test/3.parquet", 10, 100));
+        let tx = action.apply(tx).unwrap();
+
+        let table = tx.commit(&recording_catalog).await.unwrap();
+
+        // The attempt wrote a manifest list and three manifests: the one it
+        // filtered, the one for the added file, and the two merged with the
+        // manifest it kept. The manifest list names the merged one only.
+        let attempt_files = attempt_files.lock().unwrap().clone();
+        let manifests = load_current_manifests(&table).await;
+        let entries = load_current_entries(&table).await;
+        assert_eq!(attempt_files[0].len(), 4);
+        assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 2);
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(collect_live_paths(&entries), [
+            "test/2.parquet",
+            "test/3.parquet"
+        ]);
+        assert_eq!(count_stored_files(&table, &table_files).await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_commit_of_two_appends_keeps_the_manifest_only_the_first_manifest_list_names() {
+        let catalog = new_memory_catalog().await;
+        let table = make_table_with_two_manifests(&catalog).await;
+        let attempt_files = AttemptFiles::default();
+        let accepting_catalog = make_catalog_accepting_commits(&table, attempt_files.clone());
+        let tx = make_append_transaction(&table, "test/3.parquet");
+        let action = tx
+            .fast_append()
+            .with_manifest_merge(true)
+            .add_data_files(vec![make_data_file(&table, "test/4.parquet", 10, 100)]);
+        let tx = action.apply(tx).unwrap();
+
+        let table = tx.commit(&accepting_catalog).await.unwrap();
+
+        // The first append wrote a manifest list and the manifest it names.
+        // The second wrote a manifest list and two manifests: the one for its
+        // file, and that one merged with every earlier manifest, the first
+        // append's included. Its manifest list names the merged one only.
+        let attempt_files = attempt_files.lock().unwrap().clone();
+        let table_files = collect_table_files(&table).await;
+        assert_eq!(attempt_files[0].len(), 5);
+        assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 4);
+        assert_eq!(load_current_manifests(&table).await.len(), 1);
+        assert_eq!(table_files.len(), 8);
+        assert_eq!(count_stored_files(&table, &table_files).await, 8);
+    }
+
+    #[tokio::test]
+    async fn test_commit_keeps_the_manifest_of_an_action_that_wrote_no_manifest_list() {
+        let catalog = new_memory_catalog().await;
+        let table = make_table_with_one_file(&catalog, "0").await;
+        let manifest_path = format!(
+            "{}/lone-m0.avro",
+            table.metadata().metadata_location().unwrap()
+        );
+        let action = WriteLoneManifestAction {
+            manifest_path: manifest_path.clone(),
+        };
+        let tx = action.apply(Transaction::new(&table)).unwrap();
+
+        tx.commit(&catalog).await.unwrap();
+
+        assert!(table.file_io().exists(&manifest_path).await.unwrap());
     }
 }

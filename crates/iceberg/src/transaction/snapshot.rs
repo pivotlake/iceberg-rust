@@ -294,7 +294,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_manifest_path = self.generate_manifest_file_path()?;
         let output_file = self
             .written_files
-            .new_output(self.table.file_io(), new_manifest_path)?;
+            .new_manifest_output(self.table.file_io(), new_manifest_path)?;
         let partition_spec = self
             .table
             .metadata()
@@ -536,9 +536,11 @@ impl<'a> SnapshotProducer<'a> {
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
 
-        let raw_output = self
-            .written_files
-            .new_output(self.table.file_io(), manifest_list_path.clone())?;
+        let raw_output = self.written_files.new_manifest_list_output(
+            self.table.file_io(),
+            manifest_list_path.clone(),
+            &manifests,
+        )?;
 
         let (writer, encryption_key_id) = match self.table.encryption_manager() {
             Some(em) => {

@@ -213,7 +213,7 @@ impl ManifestMergeManager {
 
         let mut writer = new_manifest_writer(
             table,
-            written_files.new_output(table.file_io(), generate_manifest_path()?)?,
+            written_files.new_manifest_output(table.file_io(), generate_manifest_path()?)?,
             Some(snapshot_id),
             ManifestContentType::Data,
             schema.clone(),

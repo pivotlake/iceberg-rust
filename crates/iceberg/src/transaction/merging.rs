@@ -211,7 +211,8 @@ impl ManifestFilterManager {
                 manifest_counter.fetch_add(1, Ordering::Relaxed),
                 DataFileFormat::Avro,
             );
-            let output_file = written_files.new_output(table.file_io(), new_manifest_path)?;
+            let output_file =
+                written_files.new_manifest_output(table.file_io(), new_manifest_path)?;
             // Use the current snapshot_id so that the manifest list writer
             // can assign sequence numbers to this rewritten manifest.
             let mut writer = new_manifest_writer(
@@ -455,7 +456,7 @@ impl MergingSnapshotProducer {
         written_files: &WrittenFiles,
     ) -> Result<ManifestFile> {
         let new_manifest_path = self.generate_manifest_file_path(table)?;
-        let output_file = written_files.new_output(table.file_io(), new_manifest_path)?;
+        let output_file = written_files.new_manifest_output(table.file_io(), new_manifest_path)?;
         let schema = table.metadata().current_schema().clone();
         let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
 
