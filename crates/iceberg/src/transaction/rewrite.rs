@@ -32,6 +32,7 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestContentType, Operation};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
+use crate::transaction::written_files::WrittenFiles;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
 
@@ -211,9 +212,18 @@ impl RewriteFilesAction {
 #[async_trait]
 impl TransactionAction for RewriteFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        self.commit_recording_files(table, &WrittenFiles::default())
+            .await
+    }
+
+    async fn commit_recording_files(
+        self: Arc<Self>,
+        table: &Table,
+        written_files: &WrittenFiles,
+    ) -> Result<ActionCommit> {
         self.validate()?;
         self.validate_no_new_deletes(table).await?;
-        self.producer.commit_snapshot(table).await
+        self.producer.commit_snapshot(table, written_files).await
     }
 }
 

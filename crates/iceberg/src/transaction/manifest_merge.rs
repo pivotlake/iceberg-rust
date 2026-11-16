@@ -33,6 +33,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::merging::new_manifest_writer;
+use crate::transaction::written_files::WrittenFiles;
 use crate::{Error, ErrorKind};
 
 /// Bin-packs the data manifests of a snapshot being produced.
@@ -94,7 +95,7 @@ impl ManifestMergeManager {
     /// commit keeps, some of which it may have rewritten. A manifest that is
     /// not merged is returned as the same [`ManifestFile`], so earlier
     /// snapshots keep sharing it. `generate_manifest_path` names each manifest
-    /// written.
+    /// written, and `written_files` records it.
     ///
     /// With merging disabled by the table, the carried manifests are returned
     /// as they are, followed by the new ones.
@@ -105,6 +106,7 @@ impl ManifestMergeManager {
         new_manifests: Vec<ManifestFile>,
         mut carried_manifests: Vec<ManifestFile>,
         mut generate_manifest_path: impl FnMut() -> Result<String> + Send,
+        written_files: &WrittenFiles,
     ) -> Result<Vec<ManifestFile>> {
         if !self.merge_enabled {
             carried_manifests.extend(new_manifests);
@@ -148,7 +150,13 @@ impl ManifestMergeManager {
                     continue;
                 }
                 match self
-                    .merge_bin(table, snapshot_id, &bin, &mut generate_manifest_path)
+                    .merge_bin(
+                        table,
+                        snapshot_id,
+                        &bin,
+                        &mut generate_manifest_path,
+                        written_files,
+                    )
                     .await?
                 {
                     Some(merged_manifest) => merged_manifests.push(merged_manifest),
@@ -174,6 +182,7 @@ impl ManifestMergeManager {
         snapshot_id: i64,
         bin: &[&ManifestFile],
         generate_manifest_path: &mut (impl FnMut() -> Result<String> + Send),
+        written_files: &WrittenFiles,
     ) -> Result<Option<ManifestFile>> {
         let schema = table.metadata().current_schema();
         let Some(partition_spec) = table
@@ -204,7 +213,7 @@ impl ManifestMergeManager {
 
         let mut writer = new_manifest_writer(
             table,
-            table.file_io().new_output(generate_manifest_path()?)?,
+            written_files.new_output(table.file_io(), generate_manifest_path()?)?,
             Some(snapshot_id),
             ManifestContentType::Data,
             schema.clone(),

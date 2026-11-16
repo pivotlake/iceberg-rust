@@ -65,7 +65,9 @@ mod update_properties;
 mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
+mod written_files;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,13 +87,17 @@ pub use crate::transaction::update_properties::UpdatePropertiesAction;
 pub use crate::transaction::update_schema::UpdateSchemaAction;
 pub use crate::transaction::update_statistics::UpdateStatisticsAction;
 pub use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
+use crate::transaction::written_files::WrittenFiles;
+use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
 
 /// Table transaction.
 #[derive(Clone)]
 pub struct Transaction {
     table: Table,
     actions: Vec<BoxedTransactionAction>,
+    /// The files written by commit attempts whose outcome is unknown. They
+    /// may be live, so no later attempt deletes them.
+    unknown_outcome_files: HashSet<String>,
 }
 
 impl Transaction {
@@ -100,6 +106,7 @@ impl Transaction {
         Self {
             table: table.clone(),
             actions: vec![],
+            unknown_outcome_files: HashSet::new(),
         }
     }
 
@@ -185,6 +192,13 @@ impl Transaction {
     }
 
     /// Commit transaction.
+    ///
+    /// The manifests and manifest lists of an attempt that did not commit are
+    /// deleted: an attempt that failed before the catalog was asked, and an
+    /// attempt the catalog rejected with
+    /// [`ErrorKind::CatalogCommitConflicts`], whether or not it is retried.
+    /// When [`Catalog::update_table`] fails with any other error the commit
+    /// may have been applied, so the files of that attempt are kept.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
             // nothing to commit
@@ -230,12 +244,45 @@ impl Transaction {
             self.table = refreshed.clone();
         }
 
+        let written_files = WrittenFiles::default();
+        let table_commit = match self.build_table_commit(&written_files).await {
+            Ok(table_commit) => table_commit,
+            Err(error) => {
+                // The catalog was never asked, so nothing can reference the
+                // files written so far.
+                self.delete_uncommitted_files(written_files.take_paths())
+                    .await;
+                return Err(error);
+            }
+        };
+
+        match catalog.update_table(table_commit).await {
+            Ok(table) => Ok(table),
+            Err(error) if is_commit_rejected(&error) => {
+                self.delete_uncommitted_files(written_files.take_paths())
+                    .await;
+                Err(error)
+            }
+            Err(error) => {
+                self.unknown_outcome_files
+                    .extend(written_files.take_paths());
+                Err(error)
+            }
+        }
+    }
+
+    /// Runs the actions on top of the transaction's table and returns the
+    /// commit that carries their updates and requirements. The manifests and
+    /// manifest lists the actions write are recorded in `written_files`.
+    async fn build_table_commit(&self, written_files: &WrittenFiles) -> Result<TableCommit> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
 
         for action in &self.actions {
-            let action_commit = Arc::clone(action).commit(&current_table).await?;
+            let action_commit = Arc::clone(action)
+                .commit_recording_files(&current_table, written_files)
+                .await?;
             // apply action commit to current_table
             current_table = Self::apply(
                 current_table,
@@ -245,14 +292,44 @@ impl Transaction {
             )?;
         }
 
-        let table_commit = TableCommit::builder()
+        Ok(TableCommit::builder()
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
             .requirements(existing_requirements)
-            .build();
-
-        catalog.update_table(table_commit).await
+            .build())
     }
+
+    /// Deletes the files, at `paths`, of an attempt that did not commit.
+    ///
+    /// A path an earlier attempt of unknown outcome also wrote is kept: that
+    /// attempt may have committed, and the file may be live.
+    async fn delete_uncommitted_files(&self, paths: Vec<String>) {
+        let file_io = self.table.file_io();
+        for path in paths {
+            if self.unknown_outcome_files.contains(&path) {
+                continue;
+            }
+            // A file that cannot be deleted stays in storage, referenced by
+            // nothing; the commit still fails with its own error.
+            if let Err(error) = file_io.delete(&path).await {
+                tracing::warn!(
+                    "Failed to delete {path}, written by a commit to table {} that did not succeed: {error}",
+                    self.table.identifier()
+                );
+            }
+        }
+    }
+}
+
+/// Whether `error`, returned by [`Catalog::update_table`], says the catalog
+/// rejected the commit, so that the table is known to be unchanged.
+///
+/// Only [`ErrorKind::CatalogCommitConflicts`] says so. Any other error leaves
+/// the outcome unknown: the catalog may have applied the commit and failed
+/// afterwards, as when a response is lost or a server times out, which is what
+/// Java reports with `CommitStateUnknownException`.
+fn is_commit_rejected(error: &Error) -> bool {
+    error.kind() == ErrorKind::CatalogCommitConflicts
 }
 
 #[cfg(test)]
@@ -831,5 +908,305 @@ mod test_row_lineage {
         assert_eq!(manifest_list.entries().len(), 2);
         let manifest_file = &manifest_list.entries()[1];
         assert_eq!(manifest_file.first_row_id, Some(30));
+    }
+}
+
+#[cfg(test)]
+mod test_uncommitted_files {
+    use std::sync::{Arc, Mutex};
+
+    use uuid::Uuid;
+
+    use crate::catalog::MockCatalog;
+    use crate::memory::tests::new_memory_catalog;
+    use crate::spec::{Snapshot, TableProperties};
+    use crate::table::Table;
+    use crate::transaction::tests::{
+        append_files, load_current_manifests, make_data_file, make_v2_minimal_table_in_catalog,
+        set_table_properties,
+    };
+    use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::{Catalog, Error, ErrorKind, TableCommit, TableUpdate};
+
+    /// The files each `update_table` call found written by the attempt that
+    /// made it, in call order.
+    type AttemptFiles = Arc<Mutex<Vec<Vec<String>>>>;
+
+    /// A V2 table in `catalog` holding one file, whose commits are retried
+    /// `num_retries` times.
+    async fn make_table_with_one_file(catalog: &impl Catalog, num_retries: &str) -> Table {
+        let table = make_v2_minimal_table_in_catalog(catalog).await;
+        let table = set_table_properties(catalog, &table, &[
+            (TableProperties::PROPERTY_COMMIT_NUM_RETRIES, num_retries),
+            (TableProperties::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS, "1"),
+        ])
+        .await;
+        let file = make_data_file(&table, "test/1.parquet", 10, 100);
+        append_files(catalog, &table, vec![file]).await
+    }
+
+    /// A transaction appending one file at `path` to `table`.
+    fn make_append_transaction(table: &Table, path: &str) -> Transaction {
+        let tx = Transaction::new(table);
+        let file = make_data_file(table, path, 10, 100);
+        tx.fast_append()
+            .add_data_files(vec![file])
+            .apply(tx)
+            .unwrap()
+    }
+
+    fn make_conflict() -> Error {
+        Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict").with_retryable(true)
+    }
+
+    /// The paths of the manifests named like `manifest_path` with a lower
+    /// number, which the same commit wrote before it.
+    fn list_earlier_manifest_paths(manifest_path: &str) -> Vec<String> {
+        let (prefix, numbered_suffix) = manifest_path.rsplit_once("-m").unwrap();
+        let (number, extension) = numbered_suffix.split_once('.').unwrap();
+        (0..number.parse::<u64>().unwrap())
+            .map(|earlier_number| format!("{prefix}-m{earlier_number}.{extension}"))
+            .collect()
+    }
+
+    /// The files in storage that the commit producing `snapshot` wrote: its
+    /// manifest list, the manifests it lists as its own, and the manifests it
+    /// wrote before those and does not list.
+    async fn collect_snapshot_files(table: &Table, snapshot: &Snapshot) -> Vec<String> {
+        let snapshot = Arc::new(snapshot.clone());
+        let manifest_list = table.manifest_list_reader(&snapshot).load().await.unwrap();
+        let mut paths = vec![snapshot.manifest_list().to_string()];
+        for manifest in manifest_list.entries() {
+            if manifest.added_snapshot_id != snapshot.snapshot_id() {
+                continue;
+            }
+            for earlier_path in list_earlier_manifest_paths(&manifest.manifest_path) {
+                let is_listed = paths.contains(&earlier_path);
+                if !is_listed && table.file_io().exists(&earlier_path).await.unwrap() {
+                    paths.push(earlier_path);
+                }
+            }
+            paths.push(manifest.manifest_path.clone());
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// The manifest list and the manifests of every snapshot of `table`.
+    async fn collect_table_files(table: &Table) -> Vec<String> {
+        let mut paths = Vec::new();
+        for snapshot in table.metadata().snapshots() {
+            paths.extend(collect_snapshot_files(table, snapshot).await);
+        }
+        paths
+    }
+
+    /// How many of `paths` are in the storage of `table`.
+    async fn count_stored_files(table: &Table, paths: &[String]) -> usize {
+        let mut stored_count = 0;
+        for path in paths {
+            if table.file_io().exists(path).await.unwrap() {
+                stored_count += 1;
+            }
+        }
+        stored_count
+    }
+
+    /// A catalog serving the tables of `catalog`, whose `update_table` records
+    /// the files of the attempt in `attempt_files`, then fails with the next
+    /// of `failures` or, once they are used up, commits to `catalog`.
+    fn make_catalog_failing_commits<C: Catalog + 'static>(
+        catalog: Arc<C>,
+        failures: Vec<Error>,
+        attempt_files: AttemptFiles,
+    ) -> MockCatalog {
+        let mut mock_catalog = MockCatalog::new();
+
+        let loading_catalog = catalog.clone();
+        mock_catalog
+            .expect_load_table()
+            .returning_st(move |table_ident| {
+                let catalog = loading_catalog.clone();
+                let table_ident = table_ident.clone();
+                Box::pin(async move { catalog.load_table(&table_ident).await })
+            });
+
+        let mut failures = failures.into_iter();
+        mock_catalog
+            .expect_update_table()
+            .returning_st(move |mut commit| {
+                let catalog = catalog.clone();
+                let attempt_files = attempt_files.clone();
+                let failure = failures.next();
+                Box::pin(async move {
+                    let table = catalog.load_table(commit.identifier()).await?;
+                    let updates = commit.take_updates();
+                    let mut written_files = Vec::new();
+                    for update in &updates {
+                        if let TableUpdate::AddSnapshot { snapshot } = update {
+                            written_files.extend(collect_snapshot_files(&table, snapshot).await);
+                        }
+                    }
+                    attempt_files.lock().unwrap().push(written_files);
+                    match failure {
+                        Some(error) => Err(error),
+                        None => {
+                            let commit = TableCommit::builder()
+                                .ident(commit.identifier().clone())
+                                .updates(updates)
+                                .requirements(commit.take_requirements())
+                                .build();
+                            catalog.update_table(commit).await
+                        }
+                    }
+                })
+            });
+
+        mock_catalog
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejected_with_conflict_deletes_the_files_it_wrote() {
+        let catalog = Arc::new(new_memory_catalog().await);
+        let table = make_table_with_one_file(catalog.as_ref(), "0").await;
+        let table_files = collect_table_files(&table).await;
+        let attempt_files = AttemptFiles::default();
+        let failing_catalog =
+            make_catalog_failing_commits(catalog, vec![make_conflict()], attempt_files.clone());
+        let tx = make_append_transaction(&table, "test/2.parquet");
+
+        let error = tx.commit(&failing_catalog).await.unwrap_err();
+
+        let attempt_files = attempt_files.lock().unwrap().clone();
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert_eq!(attempt_files.len(), 1);
+        assert_eq!(attempt_files[0].len(), 2);
+        assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 0);
+        assert_eq!(count_stored_files(&table, &table_files).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_commit_retried_after_conflict_keeps_only_the_files_of_the_attempt_that_committed()
+    {
+        let catalog = Arc::new(new_memory_catalog().await);
+        let table = make_table_with_one_file(catalog.as_ref(), "1").await;
+        let attempt_files = AttemptFiles::default();
+        let failing_catalog =
+            make_catalog_failing_commits(catalog, vec![make_conflict()], attempt_files.clone());
+        let tx = make_append_transaction(&table, "test/2.parquet");
+
+        let table = tx.commit(&failing_catalog).await.unwrap();
+
+        let attempt_files = attempt_files.lock().unwrap().clone();
+        let current_snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(attempt_files.len(), 2);
+        assert_eq!(attempt_files[0].len(), 2);
+        assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 0);
+        assert_eq!(
+            collect_snapshot_files(&table, current_snapshot).await,
+            attempt_files[1]
+        );
+        assert_eq!(load_current_manifests(&table).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_commit_with_unknown_outcome_keeps_the_files_it_wrote() {
+        let catalog = Arc::new(new_memory_catalog().await);
+        let table = make_table_with_one_file(catalog.as_ref(), "0").await;
+        let attempt_files = AttemptFiles::default();
+        let lost_response = Error::new(ErrorKind::Unexpected, "Gateway timeout");
+        let failing_catalog =
+            make_catalog_failing_commits(catalog, vec![lost_response], attempt_files.clone());
+        let tx = make_append_transaction(&table, "test/2.parquet");
+
+        let error = tx.commit(&failing_catalog).await.unwrap_err();
+
+        let attempt_files = attempt_files.lock().unwrap().clone();
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert_eq!(attempt_files[0].len(), 2);
+        assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_successful_commit_keeps_the_files_it_wrote() {
+        let catalog = Arc::new(new_memory_catalog().await);
+        let table = make_table_with_one_file(catalog.as_ref(), "0").await;
+        let attempt_files = AttemptFiles::default();
+        let recording_catalog =
+            make_catalog_failing_commits(catalog, vec![], attempt_files.clone());
+        let tx = make_append_transaction(&table, "test/2.parquet");
+
+        let table = tx.commit(&recording_catalog).await.unwrap();
+
+        let attempt_files = attempt_files.lock().unwrap().clone();
+        let table_files = collect_table_files(&table).await;
+        assert_eq!(attempt_files[0].len(), 2);
+        assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 2);
+        assert_eq!(count_stored_files(&table, &table_files).await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_merging_manifests_rejected_with_conflict_deletes_the_files_it_wrote() {
+        let catalog = Arc::new(new_memory_catalog().await);
+        let table = make_table_with_one_file(catalog.as_ref(), "0").await;
+        let table = set_table_properties(catalog.as_ref(), &table, &[(
+            TableProperties::PROPERTY_COMMIT_MANIFEST_MIN_COUNT_TO_MERGE,
+            "2",
+        )])
+        .await;
+        let kept_file = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(catalog.as_ref(), &table, vec![kept_file]).await;
+        let table_files = collect_table_files(&table).await;
+        let attempt_files = AttemptFiles::default();
+        let failing_catalog =
+            make_catalog_failing_commits(catalog, vec![make_conflict()], attempt_files.clone());
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_manifest_merge(true)
+            .delete_file(make_data_file(&table, "test/1.parquet", 10, 100))
+            .add_file(make_data_file(&table, "test/3.parquet", 10, 100));
+        let tx = action.apply(tx).unwrap();
+
+        let error = tx.commit(&failing_catalog).await.unwrap_err();
+
+        // The attempt wrote a manifest list and three manifests: the one it
+        // filtered, the one for the added file, and the two merged with the
+        // manifest it kept.
+        let attempt_files = attempt_files.lock().unwrap().clone();
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert_eq!(attempt_files[0].len(), 4);
+        assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 0);
+        assert_eq!(count_stored_files(&table, &table_files).await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_commit_failing_before_the_catalog_is_asked_deletes_the_files_it_wrote() {
+        let catalog = Arc::new(new_memory_catalog().await);
+        let table = make_table_with_one_file(catalog.as_ref(), "0").await;
+        let attempt_files = AttemptFiles::default();
+        let recording_catalog =
+            make_catalog_failing_commits(catalog, vec![], attempt_files.clone());
+        let commit_uuid = Uuid::now_v7();
+        let first_manifest_path = format!(
+            "{}/{commit_uuid}-m0.avro",
+            table.metadata().metadata_location().unwrap()
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .set_commit_uuid(commit_uuid)
+            .add_data_files(vec![make_data_file(&table, "test/2.parquet", 10, 100)]);
+        let tx = action.apply(tx).unwrap();
+        let already_added_file = make_data_file(&table, "test/2.parquet", 10, 100);
+        let action = tx.fast_append().add_data_files(vec![already_added_file]);
+        let tx = action.apply(tx).unwrap();
+
+        let error = tx.commit(&recording_catalog).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(attempt_files.lock().unwrap().is_empty());
+        assert!(!table.file_io().exists(&first_manifest_path).await.unwrap());
     }
 }

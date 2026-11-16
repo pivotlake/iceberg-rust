@@ -33,6 +33,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::transaction::manifest_merge::ManifestMergeManager;
+use crate::transaction::written_files::WrittenFiles;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// A trait that defines how different table operations produce new snapshots.
@@ -113,13 +114,19 @@ impl ManifestProcess for MergeManifestProcess {
     ) -> Result<Vec<ManifestFile>> {
         let table = snapshot_produce.table;
         let snapshot_id = snapshot_produce.snapshot_id;
+        let written_files = snapshot_produce.written_files;
         let (new_manifests, carried_manifests) = manifests
             .into_iter()
             .partition(|manifest| manifest.added_snapshot_id == snapshot_id);
         ManifestMergeManager::try_from_table(table)?
-            .merge_manifests(table, snapshot_id, new_manifests, carried_manifests, || {
-                snapshot_produce.generate_manifest_file_path()
-            })
+            .merge_manifests(
+                table,
+                snapshot_id,
+                new_manifests,
+                carried_manifests,
+                || snapshot_produce.generate_manifest_file_path(),
+                written_files,
+            )
             .await
     }
 }
@@ -147,6 +154,8 @@ pub(crate) struct SnapshotProducer<'a> {
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
     manifest_counter: RangeFrom<u64>,
+    /// Records the manifests and the manifest list this producer writes.
+    written_files: &'a WrittenFiles,
 }
 
 impl<'a> SnapshotProducer<'a> {
@@ -155,6 +164,7 @@ impl<'a> SnapshotProducer<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        written_files: &'a WrittenFiles,
     ) -> Self {
         Self {
             table,
@@ -163,6 +173,7 @@ impl<'a> SnapshotProducer<'a> {
             snapshot_properties,
             added_data_files,
             manifest_counter: (0..),
+            written_files,
         }
     }
 
@@ -281,7 +292,9 @@ impl<'a> SnapshotProducer<'a> {
 
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
         let new_manifest_path = self.generate_manifest_file_path()?;
-        let output_file = self.table.file_io().new_output(new_manifest_path)?;
+        let output_file = self
+            .written_files
+            .new_output(self.table.file_io(), new_manifest_path)?;
         let partition_spec = self
             .table
             .metadata()
@@ -524,9 +537,8 @@ impl<'a> SnapshotProducer<'a> {
         let first_row_id = self.table.metadata().next_row_id();
 
         let raw_output = self
-            .table
-            .file_io()
-            .new_output(manifest_list_path.clone())?;
+            .written_files
+            .new_output(self.table.file_io(), manifest_list_path.clone())?;
 
         let (writer, encryption_key_id) = match self.table.encryption_manager() {
             Some(em) => {

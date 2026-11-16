@@ -38,6 +38,7 @@ use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::transaction::manifest_merge::ManifestMergeManager;
 use crate::transaction::snapshot::SnapshotProducer;
+use crate::transaction::written_files::WrittenFiles;
 use crate::{Error, ErrorKind};
 
 /// Create a manifest writer that handles encryption when available.
@@ -106,6 +107,7 @@ impl ManifestFilterManager {
         snapshot_id: i64,
         commit_uuid: Uuid,
         manifest_counter: &AtomicU64,
+        written_files: &WrittenFiles,
     ) -> Result<(Vec<ManifestFile>, SnapshotSummaryCollector)> {
         if self.deleted_file_paths.is_empty() {
             return Ok((manifests, SnapshotSummaryCollector::default()));
@@ -209,7 +211,7 @@ impl ManifestFilterManager {
                 manifest_counter.fetch_add(1, Ordering::Relaxed),
                 DataFileFormat::Avro,
             );
-            let output_file = table.file_io().new_output(new_manifest_path)?;
+            let output_file = written_files.new_output(table.file_io(), new_manifest_path)?;
             // Use the current snapshot_id so that the manifest list writer
             // can assign sequence numbers to this rewritten manifest.
             let mut writer = new_manifest_writer(
@@ -348,8 +350,13 @@ impl MergingSnapshotProducer {
         Ok(())
     }
 
-    /// Produce manifests, compute summary, and commit a new snapshot.
-    pub(crate) async fn commit_snapshot(&self, table: &Table) -> Result<ActionCommit> {
+    /// Produce manifests, compute summary, and commit a new snapshot. Every
+    /// manifest and the manifest list written is recorded in `written_files`.
+    pub(crate) async fn commit_snapshot(
+        &self,
+        table: &Table,
+        written_files: &WrittenFiles,
+    ) -> Result<ActionCommit> {
         self.validate_data_sequence_number(table)?;
         // Create the SnapshotProducer first so we can use its snapshot_id
         // for new manifests. This ensures the manifest list writer can
@@ -359,6 +366,7 @@ impl MergingSnapshotProducer {
             self.commit_uuid,
             HashMap::new(),
             self.added_data_files.clone(),
+            written_files,
         );
         snapshot_producer.validate_added_data_files()?;
         if self.check_duplicate {
@@ -390,13 +398,17 @@ impl MergingSnapshotProducer {
                 snapshot_id,
                 self.commit_uuid,
                 &self.manifest_counter,
+                written_files,
             )
             .await?;
 
         // 3. Write a new manifest for added files.
         let mut added_manifests = Vec::new();
         if !self.added_data_files.is_empty() {
-            added_manifests.push(self.write_added_manifest(table, snapshot_id).await?);
+            added_manifests.push(
+                self.write_added_manifest(table, snapshot_id, written_files)
+                    .await?,
+            );
         }
 
         // 4. Merge small data manifests, or list the added manifest last.
@@ -408,6 +420,7 @@ impl MergingSnapshotProducer {
                     added_manifests,
                     filtered_manifests,
                     || self.generate_manifest_file_path(table),
+                    written_files,
                 )
                 .await?
         } else {
@@ -435,9 +448,14 @@ impl MergingSnapshotProducer {
         ))
     }
 
-    async fn write_added_manifest(&self, table: &Table, snapshot_id: i64) -> Result<ManifestFile> {
+    async fn write_added_manifest(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+        written_files: &WrittenFiles,
+    ) -> Result<ManifestFile> {
         let new_manifest_path = self.generate_manifest_file_path(table)?;
-        let output_file = table.file_io().new_output(new_manifest_path)?;
+        let output_file = written_files.new_output(table.file_io(), new_manifest_path)?;
         let schema = table.metadata().current_schema().clone();
         let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
 
