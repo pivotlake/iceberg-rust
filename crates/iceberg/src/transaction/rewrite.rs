@@ -1688,4 +1688,143 @@ mod tests {
             "test/2.parquet"
         ]);
     }
+
+    /// Delete the object of `manifest`, so that reading it fails.
+    async fn make_unreadable(table: &Table, manifest: &ManifestFile) {
+        table
+            .file_io()
+            .delete(&manifest.manifest_path)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_leaves_a_manifest_of_another_partition_unread() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let spec_id = table.metadata().default_partition_spec_id();
+        let f1 = make_file_in_spec("test/1.parquet", 10, spec_id, Literal::long(1));
+        let f2 = make_file_in_spec("test/2.parquet", 10, spec_id, Literal::long(2));
+        let f3 = make_file_in_spec("test/3.parquet", 10, spec_id, Literal::long(1));
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let other_partition = load_current_manifests(&table).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let other_partition: Vec<ManifestFile> = load_current_manifests(&table)
+            .await
+            .into_iter()
+            .filter(|manifest| !other_partition.contains(manifest))
+            .collect();
+        make_unreadable(&table, &other_partition[0]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .delete_file(f1)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let manifests = load_current_manifests(&table).await;
+        assert_eq!(other_partition.len(), 1);
+        assert!(manifests.contains(&other_partition[0]));
+        assert_eq!(manifests.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_reads_no_manifest_after_finding_every_removed_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let manifests_before = load_current_manifests(&table).await;
+        let first_manifest = table
+            .manifest_reader()
+            .read(&manifests_before[0])
+            .await
+            .unwrap();
+        let in_first_manifest = if first_manifest.entries()[0].file_path() == f1.file_path() {
+            f1
+        } else {
+            f2
+        };
+        make_unreadable(&table, &manifests_before[1]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .delete_file(in_first_manifest)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let manifests = load_current_manifests(&table).await;
+        assert_eq!(manifests_before.len(), 2);
+        assert!(manifests.contains(&manifests_before[1]));
+        assert!(!manifests.contains(&manifests_before[0]));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_removes_files_of_two_partitions() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let spec_id = table.metadata().default_partition_spec_id();
+        let f1 = make_file_in_spec("test/1.parquet", 10, spec_id, Literal::long(1));
+        let f2 = make_file_in_spec("test/2.parquet", 10, spec_id, Literal::long(2));
+        let f3 = make_file_in_spec("test/3.parquet", 10, spec_id, Literal::long(3));
+        let f4 = make_file_in_spec("test/4.parquet", 20, spec_id, Literal::long(1));
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f3]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file(f1)
+            .delete_file(f2)
+            .add_file(f4);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), [
+            "test/3.parquet",
+            "test/4.parquet"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_removes_a_file_of_the_null_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let spec_id = table.metadata().default_partition_spec_id();
+        let in_null_partition = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::from_iter([None::<Literal>]))
+            .partition_spec_id(spec_id)
+            .build()
+            .unwrap();
+        let f2 = make_file_in_spec("test/2.parquet", 10, spec_id, Literal::long(2));
+        let f3 = make_file_in_spec("test/3.parquet", 10, spec_id, Literal::long(2));
+        let table = append_files(&catalog, &table, vec![in_null_partition.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file(in_null_partition)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), [
+            "test/2.parquet",
+            "test/3.parquet"
+        ]);
+    }
 }
