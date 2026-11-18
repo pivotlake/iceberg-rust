@@ -91,7 +91,27 @@ impl RewriteFilesAction {
     /// The file must exist in the current snapshot; otherwise the commit
     /// will fail with a validation error.
     pub fn delete_file(mut self, file: DataFile) -> Self {
-        self.producer.delete_data_file(file);
+        self.producer.delete_data_file(file, None);
+        self
+    }
+
+    /// Register a data file to be removed from the table, naming the
+    /// manifest that lists it: `manifest_path` is the path of that manifest
+    /// as the manifest list of the snapshot the rewrite was planned against
+    /// records it.
+    ///
+    /// The commit then reads that manifest for the file's entry before any
+    /// other, and no other when every file to remove was found where it was
+    /// said to be. A file the named manifest does not list, or whose named
+    /// manifest the snapshot committed on no longer lists, is looked for as
+    /// [`delete_file`](Self::delete_file) looks for it.
+    pub fn delete_file_listed_in(
+        mut self,
+        file: DataFile,
+        manifest_path: impl Into<String>,
+    ) -> Self {
+        self.producer
+            .delete_data_file(file, Some(manifest_path.into()));
         self
     }
 
@@ -1826,5 +1846,92 @@ mod tests {
             "test/2.parquet",
             "test/3.parquet"
         ]);
+    }
+
+    /// The file among `files` that `manifest` lists.
+    async fn find_file_listed_in(
+        table: &Table,
+        manifest: &ManifestFile,
+        files: &[DataFile],
+    ) -> DataFile {
+        let manifest = table.manifest_reader().read(manifest).await.unwrap();
+        let listed_path = manifest.entries()[0].file_path();
+        files
+            .iter()
+            .find(|file| file.file_path() == listed_path)
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_reads_only_the_manifest_a_removed_file_is_listed_in() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let manifests_before = load_current_manifests(&table).await;
+        let in_last_manifest = find_file_listed_in(&table, &manifests_before[1], &[f1, f2]).await;
+        make_unreadable(&table, &manifests_before[0]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .delete_file_listed_in(in_last_manifest, &manifests_before[1].manifest_path)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let manifests = load_current_manifests(&table).await;
+        assert_eq!(manifests_before.len(), 2);
+        assert!(manifests.contains(&manifests_before[0]));
+        assert!(!manifests.contains(&manifests_before[1]));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_finds_a_removed_file_another_manifest_lists() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let manifests_before = load_current_manifests(&table).await;
+        let in_last_manifest =
+            find_file_listed_in(&table, &manifests_before[1], &[f1, f2.clone()]).await;
+        let removed_path = in_last_manifest.file_path().to_string();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file_listed_in(in_last_manifest, &manifests_before[0].manifest_path)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert!(!collect_live_paths(&entries).contains(&removed_path.as_str()));
+        assert_eq!(collect_live_paths(&entries).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_finds_a_removed_file_whose_named_manifest_is_not_listed() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file_listed_in(f1, "test/metadata/no-such-manifest.avro")
+            .add_file(f2);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), ["test/2.parquet"]);
     }
 }

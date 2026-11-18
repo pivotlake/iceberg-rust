@@ -87,14 +87,23 @@ pub(crate) fn new_manifest_writer(
 /// Only the manifests that may list a file to delete are read: a manifest of
 /// another partition spec, or whose partition summaries rule out the
 /// partition of every file to delete, is kept as it is without being read.
-/// The others are read [`MANIFEST_READ_CONCURRENCY`] at a time, in the order
-/// the manifest list has them, until every file to delete has been found: a
-/// snapshot lists a live file in one manifest, so the manifests after that
-/// are kept unread too.
+/// The others are read [`MANIFEST_READ_CONCURRENCY`] at a time until every
+/// file to delete has been found: a snapshot lists a live file in one
+/// manifest, so the manifests after that are kept unread too. The manifests
+/// the files to delete are said to be listed in are read first, and the
+/// others, in the order the manifest list has them, only when a file was not
+/// found where it was said to be.
 pub(crate) struct ManifestFilterManager {
     /// The files to delete, by path.
-    deleted_files: HashMap<String, DataFile>,
+    deleted_files: HashMap<String, DeletedFile>,
     fail_missing_delete_paths: bool,
+}
+
+/// A file to delete.
+struct DeletedFile {
+    file: DataFile,
+    /// The path of the manifest the file is said to be listed in.
+    manifest_path: Option<String>,
 }
 
 /// How many manifests [`ManifestFilterManager::filter_manifests`] reads at
@@ -109,8 +118,21 @@ impl ManifestFilterManager {
         }
     }
 
-    pub(crate) fn add_delete(&mut self, file: DataFile) {
-        self.deleted_files.insert(file.file_path.clone(), file);
+    /// Delete `file`, which the manifest at `manifest_path` is said to
+    /// list, when one is named.
+    pub(crate) fn add_delete(&mut self, file: DataFile, manifest_path: Option<String>) {
+        self.deleted_files
+            .insert(file.file_path.clone(), DeletedFile {
+                file,
+                manifest_path,
+            });
+    }
+
+    /// Whether a file to delete is said to be listed in `manifest_file`.
+    fn is_named_by_deleted_file(&self, manifest_file: &ManifestFile) -> bool {
+        self.deleted_files.values().any(|deleted| {
+            deleted.manifest_path.as_deref() == Some(manifest_file.manifest_path.as_str())
+        })
     }
 
     /// Whether `manifest_file`, a data manifest, may list a file to delete:
@@ -121,6 +143,7 @@ impl ManifestFilterManager {
         let mut same_spec = self
             .deleted_files
             .values()
+            .map(|deleted| &deleted.file)
             .filter(|file| file.partition_spec_id == manifest_file.partition_spec_id)
             .peekable();
         if same_spec.peek().is_none() {
@@ -160,12 +183,22 @@ impl ManifestFilterManager {
 
         // Only data manifests are filtered, and of those only the ones that
         // may list a file to delete; every other manifest passes through
-        // unchanged and unread.
-        let candidates: Vec<usize> = manifests
-            .iter()
-            .enumerate()
+        // unchanged and unread. The manifests the files to delete are said to
+        // be listed in come first, and the others are read only when those
+        // did not list every file.
+        let data_manifests = || {
+            manifests
+                .iter()
+                .enumerate()
+                .filter(|(_, manifest_file)| manifest_file.content == ManifestContentType::Data)
+        };
+        let named: Vec<usize> = data_manifests()
+            .filter(|(_, manifest_file)| self.is_named_by_deleted_file(manifest_file))
+            .map(|(position, _)| position)
+            .collect();
+        let others: Vec<usize> = data_manifests()
             .filter(|(_, manifest_file)| {
-                manifest_file.content == ManifestContentType::Data
+                !self.is_named_by_deleted_file(manifest_file)
                     && self.may_hold_deleted_file(table, manifest_file)
             })
             .map(|(position, _)| position)
@@ -173,7 +206,7 @@ impl ManifestFilterManager {
         // What takes the place of a manifest that lists a file to delete, by
         // the manifest's position: `None` when nothing is left to say about it.
         let mut filtered: HashMap<usize, Option<ManifestFile>> = HashMap::new();
-        {
+        for candidates in [named, others] {
             let reads: Vec<_> = candidates
                 .into_iter()
                 .map(|position| read_candidate(table, &manifests[position], position))
@@ -445,8 +478,10 @@ impl MergingSnapshotProducer {
         self.manifest_merge = manifest_merge;
     }
 
-    pub(crate) fn delete_data_file(&mut self, file: DataFile) {
-        self.filter_manager.add_delete(file.clone());
+    /// Delete `file`, which the manifest at `manifest_path` is said to
+    /// list, when one is named.
+    pub(crate) fn delete_data_file(&mut self, file: DataFile, manifest_path: Option<String>) {
+        self.filter_manager.add_delete(file.clone(), manifest_path);
         self.deleted_data_files.push(file);
     }
 
