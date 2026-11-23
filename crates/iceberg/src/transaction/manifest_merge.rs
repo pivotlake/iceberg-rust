@@ -29,12 +29,135 @@ use futures::future::try_join_all;
 
 use crate::error::Result;
 use crate::spec::{
-    Manifest, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus, TableProperties,
+    Manifest, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus, ManifestWriter,
+    TableProperties,
 };
 use crate::table::Table;
 use crate::transaction::merging::new_manifest_writer;
 use crate::transaction::written_files::WrittenFiles;
 use crate::{Error, ErrorKind};
+
+/// A manifest of the snapshot being produced: one that is written, or the
+/// entries of one the commit has yet to write.
+pub(crate) enum SnapshotManifest {
+    Written(ManifestFile),
+    Unwritten(UnwrittenManifest),
+}
+
+impl SnapshotManifest {
+    fn content(&self) -> ManifestContentType {
+        match self {
+            Self::Written(manifest) => manifest.content,
+            Self::Unwritten(_) => ManifestContentType::Data,
+        }
+    }
+
+    fn partition_spec_id(&self) -> i32 {
+        match self {
+            Self::Written(manifest) => manifest.partition_spec_id,
+            Self::Unwritten(manifest) => manifest.partition_spec_id,
+        }
+    }
+
+    /// The manifest's length, estimated for one not written.
+    fn length(&self) -> u64 {
+        match self {
+            Self::Written(manifest) => manifest.manifest_length.max(0) as u64,
+            Self::Unwritten(manifest) => manifest.estimated_length,
+        }
+    }
+
+    /// Whether the snapshot `snapshot_id` lists the manifest when it is
+    /// carried from the parent snapshot: it has a live file, or the commit
+    /// producing the snapshot is the one writing it.
+    fn is_listed_when_carried(&self, snapshot_id: i64) -> bool {
+        match self {
+            Self::Written(manifest) => {
+                manifest.has_added_files()
+                    || manifest.has_existing_files()
+                    || manifest.added_snapshot_id == snapshot_id
+            }
+            Self::Unwritten(_) => true,
+        }
+    }
+
+    /// The manifest, written under the next generated path when it was not.
+    async fn into_written(
+        self,
+        table: &Table,
+        snapshot_id: i64,
+        generate_manifest_path: &mut (impl FnMut() -> Result<String> + Send),
+        written_files: &WrittenFiles,
+    ) -> Result<ManifestFile> {
+        match self {
+            Self::Written(manifest) => Ok(manifest),
+            Self::Unwritten(manifest) => {
+                manifest
+                    .write(table, snapshot_id, generate_manifest_path()?, written_files)
+                    .await
+            }
+        }
+    }
+}
+
+/// The entries of a data manifest a commit has not written: the files it
+/// adds, or what is left of a manifest it removes files from. Merged with
+/// other manifests, its entries go straight into the merged manifest, so
+/// they are neither written nor read back on their own.
+pub(crate) struct UnwrittenManifest {
+    pub(crate) partition_spec_id: i32,
+    /// Each entry with the status the manifest carries it under: `ADDED` for
+    /// a file the snapshot adds, `DELETED` for one it removes, `EXISTING`
+    /// for any other.
+    pub(crate) entries: Vec<ManifestEntry>,
+    /// About how long the manifest would be, which bin-packing goes by.
+    pub(crate) estimated_length: u64,
+}
+
+impl UnwrittenManifest {
+    /// Write the manifest at `path` for the snapshot `snapshot_id`.
+    async fn write(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+        path: String,
+        written_files: &WrittenFiles,
+    ) -> Result<ManifestFile> {
+        let partition_spec = table
+            .metadata()
+            .partition_spec_by_id(self.partition_spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Manifest references unknown partition spec {}",
+                        self.partition_spec_id
+                    ),
+                )
+            })?;
+        let mut writer = new_manifest_writer(
+            table,
+            written_files.new_manifest_output(table.file_io(), path)?,
+            Some(snapshot_id),
+            ManifestContentType::Data,
+            table.metadata().current_schema().clone(),
+            partition_spec.as_ref().clone(),
+        )?;
+        for entry in &self.entries {
+            write_entry(&mut writer, entry.clone())?;
+        }
+        writer.write_manifest_file().await
+    }
+}
+
+/// Add `entry` to the manifest `writer` writes, as its status says.
+fn write_entry(writer: &mut ManifestWriter, entry: ManifestEntry) -> Result<()> {
+    match entry.status {
+        ManifestStatus::Added => writer.add_entry(entry),
+        ManifestStatus::Existing => writer.add_existing_entry(entry),
+        ManifestStatus::Deleted => writer.add_delete_entry(entry),
+    }
+}
 
 /// Bin-packs the data manifests of a snapshot being produced.
 ///
@@ -56,6 +179,9 @@ use crate::{Error, ErrorKind};
 ///   first manifest while it has fewer than `min_count_to_merge` manifests, so
 ///   that a commit does not rewrite the newest manifests every time. Every
 ///   other bin is rewritten as one manifest.
+/// - A manifest the commit has not written yet ([`UnwrittenManifest`]) is
+///   packed by its estimated length. In a bin that is rewritten its entries
+///   go into the merged manifest; listed on its own, it is written then.
 pub(crate) struct ManifestMergeManager {
     merge_enabled: bool,
     target_size_bytes: u64,
@@ -103,70 +229,136 @@ impl ManifestMergeManager {
         &self,
         table: &Table,
         snapshot_id: i64,
-        new_manifests: Vec<ManifestFile>,
-        mut carried_manifests: Vec<ManifestFile>,
+        new_manifests: Vec<SnapshotManifest>,
+        carried_manifests: Vec<SnapshotManifest>,
         mut generate_manifest_path: impl FnMut() -> Result<String> + Send,
         written_files: &WrittenFiles,
     ) -> Result<Vec<ManifestFile>> {
         if !self.merge_enabled {
-            carried_manifests.extend(new_manifests);
-            return Ok(carried_manifests);
+            return Self::list_unmerged(
+                table,
+                snapshot_id,
+                new_manifests,
+                carried_manifests,
+                generate_manifest_path,
+                written_files,
+            )
+            .await;
         }
 
-        let (data_manifests, delete_manifests): (Vec<ManifestFile>, Vec<ManifestFile>) =
+        let (data_manifests, delete_manifests): (Vec<SnapshotManifest>, Vec<SnapshotManifest>) =
             new_manifests
                 .into_iter()
-                .chain(carried_manifests.into_iter().filter(|manifest| {
-                    manifest.has_added_files()
-                        || manifest.has_existing_files()
-                        || manifest.added_snapshot_id == snapshot_id
-                }))
-                .partition(|manifest| manifest.content == ManifestContentType::Data);
+                .chain(
+                    carried_manifests
+                        .into_iter()
+                        .filter(|manifest| manifest.is_listed_when_carried(snapshot_id)),
+                )
+                .partition(|manifest| manifest.content() == ManifestContentType::Data);
 
         let mut positions_by_spec_id: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
         for (position, manifest) in data_manifests.iter().enumerate() {
             positions_by_spec_id
-                .entry(manifest.partition_spec_id)
+                .entry(manifest.partition_spec_id())
                 .or_default()
                 .push(position);
         }
-
-        let mut merged_manifests = Vec::with_capacity(data_manifests.len());
+        let mut bins = Vec::new();
         for positions in positions_by_spec_id.into_values().rev() {
             let lengths: Vec<u64> = positions
                 .iter()
-                .map(|position| data_manifests[*position].manifest_length.max(0) as u64)
+                .map(|position| data_manifests[*position].length())
                 .collect();
             for bin in pack_from_end(&lengths, self.target_size_bytes) {
-                let holds_first_manifest = positions[bin.start] == 0;
-                let bin: Vec<&ManifestFile> = positions[bin]
-                    .iter()
-                    .map(|position| &data_manifests[*position])
-                    .collect();
-                let is_below_min_count =
-                    holds_first_manifest && bin.len() < self.min_count_to_merge;
-                if bin.len() == 1 || is_below_min_count {
-                    merged_manifests.extend(bin.into_iter().cloned());
-                    continue;
-                }
-                match self
-                    .merge_bin(
-                        table,
-                        snapshot_id,
-                        &bin,
-                        &mut generate_manifest_path,
-                        written_files,
-                    )
-                    .await?
-                {
-                    Some(merged_manifest) => merged_manifests.push(merged_manifest),
-                    None => merged_manifests.extend(bin.into_iter().cloned()),
+                bins.push(positions[bin].to_vec());
+            }
+        }
+
+        let mut data_manifests: Vec<Option<SnapshotManifest>> =
+            data_manifests.into_iter().map(Some).collect();
+        let mut merged_manifests = Vec::with_capacity(data_manifests.len());
+        for bin_positions in bins {
+            let holds_first_manifest = bin_positions[0] == 0;
+            let bin: Vec<SnapshotManifest> = bin_positions
+                .iter()
+                .map(|position| {
+                    data_manifests[*position]
+                        .take()
+                        .expect("a manifest is packed into one bin")
+                })
+                .collect();
+            let is_below_min_count = holds_first_manifest && bin.len() < self.min_count_to_merge;
+            let merged_manifest = if bin.len() == 1 || is_below_min_count {
+                None
+            } else {
+                self.merge_bin(
+                    table,
+                    snapshot_id,
+                    &bin,
+                    &mut generate_manifest_path,
+                    written_files,
+                )
+                .await?
+            };
+            match merged_manifest {
+                Some(merged_manifest) => merged_manifests.push(merged_manifest),
+                None => {
+                    for manifest in bin {
+                        merged_manifests.push(
+                            manifest
+                                .into_written(
+                                    table,
+                                    snapshot_id,
+                                    &mut generate_manifest_path,
+                                    written_files,
+                                )
+                                .await?,
+                        );
+                    }
                 }
             }
         }
 
-        merged_manifests.extend(delete_manifests);
+        for manifest in delete_manifests {
+            merged_manifests.push(
+                manifest
+                    .into_written(
+                        table,
+                        snapshot_id,
+                        &mut generate_manifest_path,
+                        written_files,
+                    )
+                    .await?,
+            );
+        }
         Ok(merged_manifests)
+    }
+
+    /// Returns the manifests the snapshot `snapshot_id` lists when none is
+    /// merged: the carried manifests, followed by the new ones, each written
+    /// when it was not yet.
+    pub(crate) async fn list_unmerged(
+        table: &Table,
+        snapshot_id: i64,
+        new_manifests: Vec<SnapshotManifest>,
+        carried_manifests: Vec<SnapshotManifest>,
+        mut generate_manifest_path: impl FnMut() -> Result<String> + Send,
+        written_files: &WrittenFiles,
+    ) -> Result<Vec<ManifestFile>> {
+        let mut manifests = Vec::with_capacity(carried_manifests.len() + new_manifests.len());
+        for manifest in carried_manifests.into_iter().chain(new_manifests) {
+            manifests.push(
+                manifest
+                    .into_written(
+                        table,
+                        snapshot_id,
+                        &mut generate_manifest_path,
+                        written_files,
+                    )
+                    .await?,
+            );
+        }
+        Ok(manifests)
     }
 
     /// Rewrite the manifests of `bin`, which share a partition spec, as one
@@ -180,35 +372,49 @@ impl ManifestMergeManager {
         &self,
         table: &Table,
         snapshot_id: i64,
-        bin: &[&ManifestFile],
+        bin: &[SnapshotManifest],
         generate_manifest_path: &mut (impl FnMut() -> Result<String> + Send),
         written_files: &WrittenFiles,
     ) -> Result<Option<ManifestFile>> {
         let schema = table.metadata().current_schema();
         let Some(partition_spec) = table
             .metadata()
-            .partition_spec_by_id(bin[0].partition_spec_id)
+            .partition_spec_by_id(bin[0].partition_spec_id())
             .filter(|spec| spec.partition_type(schema).is_ok())
         else {
             return Ok(None);
         };
 
-        let inputs = try_join_all(
-            bin.iter()
-                .map(|manifest_file| read_merge_input(table, snapshot_id, manifest_file)),
-        )
-        .await?;
-        let mut merged_entries = Vec::new();
-        for entry in inputs.iter().flat_map(|manifest| manifest.entries()) {
-            let Some(merged_entry) = to_merged_entry(entry, snapshot_id) else {
-                continue;
-            };
-            if merged_entry.status != ManifestStatus::Added
-                && merged_entry.sequence_number.is_none()
-            {
-                return Ok(None);
+        // Only the manifests that are written are read; the entries of the
+        // others are at hand.
+        let mut written_inputs = try_join_all(bin.iter().filter_map(|manifest| match manifest {
+            SnapshotManifest::Written(manifest_file) => {
+                Some(read_merge_input(table, snapshot_id, manifest_file))
             }
-            merged_entries.push(merged_entry);
+            SnapshotManifest::Unwritten(_) => None,
+        }))
+        .await?
+        .into_iter();
+        let mut merged_entries = Vec::new();
+        for manifest in bin {
+            let entries: Vec<ManifestEntry> = match manifest {
+                SnapshotManifest::Written(_) => written_inputs
+                    .next()
+                    .expect("every written manifest of the bin was read")
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| to_merged_entry(entry, snapshot_id))
+                    .collect(),
+                SnapshotManifest::Unwritten(manifest) => manifest.entries.clone(),
+            };
+            for merged_entry in entries {
+                if merged_entry.status != ManifestStatus::Added
+                    && merged_entry.sequence_number.is_none()
+                {
+                    return Ok(None);
+                }
+                merged_entries.push(merged_entry);
+            }
         }
 
         let mut writer = new_manifest_writer(
@@ -220,11 +426,7 @@ impl ManifestMergeManager {
             partition_spec.as_ref().clone(),
         )?;
         for entry in merged_entries {
-            match entry.status {
-                ManifestStatus::Added => writer.add_entry(entry)?,
-                ManifestStatus::Existing => writer.add_existing_entry(entry)?,
-                ManifestStatus::Deleted => writer.add_delete_entry(entry)?,
-            }
+            write_entry(&mut writer, entry)?;
         }
         writer.write_manifest_file().await.map(Some)
     }

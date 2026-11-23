@@ -72,6 +72,21 @@ impl WrittenFiles {
         Ok(output_file)
     }
 
+    /// Records the manifests at `paths` as written by this action: ones it
+    /// wrote ahead of the attempt.
+    pub(crate) fn record_manifests(&self, paths: &[String]) {
+        self.record
+            .lock()
+            .unwrap()
+            .manifest_paths
+            .extend(paths.iter().cloned());
+    }
+
+    /// The manifests recorded as written, in the order they were written.
+    pub(crate) fn collect_manifest_paths(&self) -> Vec<String> {
+        self.record.lock().unwrap().manifest_paths.clone()
+    }
+
     /// Creates the output file of the manifest list at `path`, recording it
     /// as written by this action and `listed_manifests`, the manifests the
     /// action writes into it, as named by it.

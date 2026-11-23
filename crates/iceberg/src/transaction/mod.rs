@@ -80,7 +80,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
-pub use crate::transaction::rewrite::RewriteFilesAction;
+pub use crate::transaction::rewrite::{PreparedRewrite, RewriteFilesAction};
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -1286,12 +1286,12 @@ mod test_uncommitted_files {
 
         let error = tx.commit(&failing_catalog).await.unwrap_err();
 
-        // The attempt wrote a manifest list and three manifests: the one it
-        // filtered, the one for the added file, and the two merged with the
-        // manifest it kept.
+        // The attempt wrote a manifest list and one manifest: what it kept
+        // of the manifest it filtered, the added file and the manifest it
+        // kept whole, merged.
         let attempt_files = attempt_files.lock().unwrap().clone();
         assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
-        assert_eq!(attempt_files[0].len(), 4);
+        assert_eq!(attempt_files[0].len(), 2);
         assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 0);
         assert_eq!(count_stored_files(&table, &table_files).await, 4);
     }
@@ -1360,7 +1360,7 @@ mod test_uncommitted_files {
     }
 
     #[tokio::test]
-    async fn test_rewrite_merging_manifests_deletes_the_manifests_it_merged_away() {
+    async fn test_rewrite_merging_manifests_writes_the_merged_manifest_alone() {
         let catalog = Arc::new(new_memory_catalog().await);
         let table = make_table_with_two_manifests(catalog.as_ref()).await;
         let table_files = collect_table_files(&table).await;
@@ -1377,13 +1377,13 @@ mod test_uncommitted_files {
 
         let table = tx.commit(&recording_catalog).await.unwrap();
 
-        // The attempt wrote a manifest list and three manifests: the one it
-        // filtered, the one for the added file, and the two merged with the
-        // manifest it kept. The manifest list names the merged one only.
+        // The attempt wrote a manifest list and one manifest, which the
+        // list names: what it kept of the manifest it filtered, the added
+        // file and the manifest it kept whole, merged.
         let attempt_files = attempt_files.lock().unwrap().clone();
         let manifests = load_current_manifests(&table).await;
         let entries = load_current_entries(&table).await;
-        assert_eq!(attempt_files[0].len(), 4);
+        assert_eq!(attempt_files[0].len(), 2);
         assert_eq!(count_stored_files(&table, &attempt_files[0]).await, 2);
         assert_eq!(manifests.len(), 1);
         assert_eq!(collect_live_paths(&entries), [

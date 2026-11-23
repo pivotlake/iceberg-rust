@@ -32,7 +32,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
-use crate::transaction::manifest_merge::ManifestMergeManager;
+use crate::transaction::manifest_merge::{ManifestMergeManager, SnapshotManifest};
 use crate::transaction::written_files::WrittenFiles;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
@@ -117,7 +117,11 @@ impl ManifestProcess for MergeManifestProcess {
         let written_files = snapshot_produce.written_files;
         let (new_manifests, carried_manifests) = manifests
             .into_iter()
-            .partition(|manifest| manifest.added_snapshot_id == snapshot_id);
+            .map(SnapshotManifest::Written)
+            .partition(|manifest| match manifest {
+                SnapshotManifest::Written(manifest) => manifest.added_snapshot_id == snapshot_id,
+                SnapshotManifest::Unwritten(_) => true,
+            });
         ManifestMergeManager::try_from_table(table)?
             .merge_manifests(
                 table,
@@ -175,6 +179,13 @@ impl<'a> SnapshotProducer<'a> {
             manifest_counter: (0..),
             written_files,
         }
+    }
+
+    /// Produce the snapshot under `snapshot_id`, an id chosen ahead that no
+    /// snapshot of the table has.
+    pub(crate) fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = snapshot_id;
+        self
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {

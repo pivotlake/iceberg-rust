@@ -23,8 +23,8 @@
 //! [`SnapshotProducer`].
 
 use std::cmp::Ordering as ValueOrdering;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::{StreamExt, stream};
 use uuid::Uuid;
@@ -39,7 +39,9 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
-use crate::transaction::manifest_merge::ManifestMergeManager;
+use crate::transaction::manifest_merge::{
+    ManifestMergeManager, SnapshotManifest, UnwrittenManifest,
+};
 use crate::transaction::snapshot::SnapshotProducer;
 use crate::transaction::written_files::WrittenFiles;
 use crate::{Error, ErrorKind};
@@ -82,7 +84,9 @@ pub(crate) fn new_manifest_writer(
 /// This is equivalent to Java's `ManifestFilterManager`. When a rewrite or
 /// overwrite operation deletes files, the filter manager rewrites affected
 /// manifests so that deleted entries are dropped and surviving entries are
-/// re-emitted with [`ManifestStatus::Existing`].
+/// re-emitted with [`ManifestStatus::Existing`]. A rewritten manifest is
+/// handed back unwritten ([`UnwrittenManifest`]): the commit writes it on
+/// its own, or its entries into the manifest it is merged into.
 ///
 /// Only the manifests that may list a file to delete are read: a manifest of
 /// another partition spec, or whose partition summaries rule out the
@@ -97,6 +101,13 @@ pub(crate) struct ManifestFilterManager {
     /// The files to delete, by path.
     deleted_files: HashMap<String, DeletedFile>,
     fail_missing_delete_paths: bool,
+}
+
+/// A file a commit removed, and the partition spec of the manifest that
+/// listed it.
+pub(crate) struct RemovedFile {
+    file: DataFile,
+    partition_spec_id: i32,
 }
 
 /// A file to delete.
@@ -163,22 +174,19 @@ impl ManifestFilterManager {
     }
 
     /// Filter `manifests` by removing entries whose file path is in the delete
-    /// set. Returns the surviving manifests plus a [`SnapshotSummaryCollector`]
-    /// that recorded metrics for every removed file.
+    /// set. Returns the surviving manifests, the ones that listed a file to
+    /// delete unwritten, plus every file removed.
     pub(crate) async fn filter_manifests(
         &self,
         table: &Table,
         manifests: Vec<ManifestFile>,
-        snapshot_id: i64,
-        commit_uuid: Uuid,
-        manifest_counter: &AtomicU64,
-        written_files: &WrittenFiles,
-    ) -> Result<(Vec<ManifestFile>, SnapshotSummaryCollector)> {
+    ) -> Result<(Vec<SnapshotManifest>, Vec<RemovedFile>)> {
         if self.deleted_files.is_empty() {
-            return Ok((manifests, SnapshotSummaryCollector::default()));
+            let manifests = manifests.into_iter().map(SnapshotManifest::Written);
+            return Ok((manifests.collect(), Vec::new()));
         }
 
-        let mut removed_collector = SnapshotSummaryCollector::default();
+        let mut removed_files = Vec::new();
         let mut found_paths: HashSet<String> = HashSet::new();
 
         // Only data manifests are filtered, and of those only the ones that
@@ -205,7 +213,7 @@ impl ManifestFilterManager {
             .collect();
         // What takes the place of a manifest that lists a file to delete, by
         // the manifest's position: `None` when nothing is left to say about it.
-        let mut filtered: HashMap<usize, Option<ManifestFile>> = HashMap::new();
+        let mut filtered: HashMap<usize, Option<UnwrittenManifest>> = HashMap::new();
         for candidates in [named, others] {
             let reads: Vec<_> = candidates
                 .into_iter()
@@ -230,23 +238,22 @@ impl ManifestFilterManager {
                     continue;
                 }
 
-                // Resolve the partition spec for this manifest. After partition
-                // evolution, old manifests may carry a non-default spec — we must
-                // use the manifest's own spec so the rewritten manifest stays valid.
-                let manifest_spec = table
+                // After partition evolution, old manifests may carry a
+                // non-default spec: the rewritten manifest keeps the
+                // manifest's own spec so that it stays valid.
+                if table
                     .metadata()
                     .partition_spec_by_id(manifest_file.partition_spec_id)
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Manifest references unknown partition spec {}",
-                                manifest_file.partition_spec_id
-                            ),
-                        )
-                    })?
-                    .clone();
-                let schema = table.metadata().current_schema().clone();
+                    .is_none()
+                {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Manifest references unknown partition spec {}",
+                            manifest_file.partition_spec_id
+                        ),
+                    ));
+                }
 
                 // Rewrite: keep surviving entries as EXISTING, and record the
                 // removed ones as DELETED so that the file they name can be
@@ -255,14 +262,18 @@ impl ManifestFilterManager {
                 let mut removed_entries: Vec<ManifestEntry> = Vec::new();
                 for entry in manifest.entries() {
                     if entry.is_alive() && self.deleted_files.contains_key(entry.file_path()) {
-                        // Record removal metrics.
                         found_paths.insert(entry.file_path().to_string());
-                        removed_collector.remove_file(
-                            entry.data_file(),
-                            schema.clone(),
-                            manifest_spec.clone(),
-                        );
-                        removed_entries.push(entry.as_ref().clone());
+                        removed_files.push(RemovedFile {
+                            file: entry.data_file().clone(),
+                            partition_spec_id: manifest_file.partition_spec_id,
+                        });
+                        // The manifest writer stamps the removing snapshot
+                        // on the entry and keeps the file's own sequence
+                        // numbers, which is what an expiring reader needs to
+                        // attribute the removal.
+                        let mut removed_entry = entry.as_ref().clone();
+                        removed_entry.status = ManifestStatus::Deleted;
+                        removed_entries.push(removed_entry);
                     } else if entry.is_alive() {
                         // Surviving entry — re-emit as EXISTING with original ids preserved.
                         let seq = entry.sequence_number().ok_or_else(|| {
@@ -296,47 +307,27 @@ impl ManifestFilterManager {
                     continue;
                 }
 
-                // Write the filtered manifest using the manifest's own partition spec.
-                let new_manifest_path = format!(
-                    "{}/{}-m{}.{}",
-                    table.metadata().metadata_location()?,
-                    commit_uuid,
-                    manifest_counter.fetch_add(1, Ordering::Relaxed),
-                    DataFileFormat::Avro,
+                // The filtered manifest is about as long as the one it
+                // takes the place of.
+                surviving_entries.extend(removed_entries);
+                filtered.insert(
+                    position,
+                    Some(UnwrittenManifest {
+                        partition_spec_id: manifest_file.partition_spec_id,
+                        entries: surviving_entries,
+                        estimated_length: manifest_file.manifest_length.max(0) as u64,
+                    }),
                 );
-                let output_file =
-                    written_files.new_manifest_output(table.file_io(), new_manifest_path)?;
-                // Use the current snapshot_id so that the manifest list writer
-                // can assign sequence numbers to this rewritten manifest.
-                let mut writer = new_manifest_writer(
-                    table,
-                    output_file,
-                    Some(snapshot_id),
-                    ManifestContentType::Data,
-                    schema.clone(),
-                    manifest_spec.as_ref().clone(),
-                )?;
-                for entry in surviving_entries {
-                    writer.add_existing_entry(entry)?;
-                }
-                for entry in removed_entries {
-                    // `add_delete_entry` stamps the removing snapshot on the entry
-                    // and keeps the file's own sequence numbers, which is what an
-                    // expiring reader needs to attribute the removal.
-                    writer.add_delete_entry(entry)?;
-                }
-                let new_manifest = writer.write_manifest_file().await?;
-                filtered.insert(position, Some(new_manifest));
             }
         }
 
-        let result: Vec<ManifestFile> = manifests
+        let result: Vec<SnapshotManifest> = manifests
             .into_iter()
             .enumerate()
             .filter_map(
                 |(position, manifest_file)| match filtered.remove(&position) {
-                    Some(replacement) => replacement,
-                    None => Some(manifest_file),
+                    Some(replacement) => replacement.map(SnapshotManifest::Unwritten),
+                    None => Some(SnapshotManifest::Written(manifest_file)),
                 },
             )
             .collect();
@@ -360,7 +351,7 @@ impl ManifestFilterManager {
             }
         }
 
-        Ok((result, removed_collector))
+        Ok((result, removed_files))
     }
 }
 
@@ -416,6 +407,57 @@ fn may_hold_partition(
         })
 }
 
+impl PreparedManifests {
+    /// The manifests the snapshot lists on top of `table`, or `None` when
+    /// the manifests written ahead no longer stand on it.
+    async fn list_on(&self, table: &Table) -> Result<Option<Vec<ManifestFile>>> {
+        let metadata = table.metadata();
+        if metadata.current_schema_id() != self.schema_id
+            || metadata.default_partition_spec_id() != self.default_partition_spec_id
+            || metadata.snapshot_by_id(self.snapshot_id).is_some()
+        {
+            return Ok(None);
+        }
+        let Some(snapshot) = metadata.current_snapshot() else {
+            return Ok(None);
+        };
+        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+        let current_manifest_paths: HashSet<&str> = manifest_list
+            .entries()
+            .iter()
+            .map(|manifest| manifest.manifest_path.as_str())
+            .collect();
+        let kept_manifest_paths: HashSet<&str> = self
+            .manifests
+            .iter()
+            .map(|manifest| manifest.manifest_path.as_str())
+            .collect();
+        let is_replaced_manifest_gone = self.base_manifest_paths.iter().any(|path| {
+            !kept_manifest_paths.contains(path.as_str())
+                && !current_manifest_paths.contains(path.as_str())
+        });
+        if is_replaced_manifest_gone {
+            return Ok(None);
+        }
+
+        let gained_manifests = manifest_list
+            .entries()
+            .iter()
+            .filter(|manifest| !self.base_manifest_paths.contains(&manifest.manifest_path))
+            .filter(|manifest| manifest.has_added_files() || manifest.has_existing_files());
+        let standing_manifests = self.manifests.iter().filter(|manifest| {
+            !self.base_manifest_paths.contains(&manifest.manifest_path)
+                || current_manifest_paths.contains(manifest.manifest_path.as_str())
+        });
+        Ok(Some(
+            gained_manifests
+                .chain(standing_manifests)
+                .cloned()
+                .collect(),
+        ))
+    }
+}
+
 /// Shared engine for operations that both add and remove data files.
 ///
 /// This struct is the Rust equivalent of Java's `MergingSnapshotProducer`.
@@ -445,6 +487,48 @@ pub(crate) struct MergingSnapshotProducer {
     /// commit retry cannot overwrite a manifest an earlier attempt wrote
     /// under the same commit uuid.
     manifest_counter: AtomicU64,
+    /// The manifests of the snapshot written ahead of the commit, when they
+    /// were ([`prepare`](Self::prepare)).
+    prepared: Option<PreparedManifests>,
+    /// Whether an attempt has taken the prepared manifests. An attempt that
+    /// does not commit deletes what it recorded as written, them included,
+    /// so only the first attempt may list them.
+    is_prepared_taken: AtomicBool,
+}
+
+/// The manifests of a snapshot, written ahead of its commit on top of the
+/// snapshot the table had then, its base.
+///
+/// A commit lists them as they are when the table still lists every manifest
+/// of the base they took the place of, and still has the schema and the
+/// default partition spec they were written under. The manifests the table
+/// gained since are listed first, and a manifest of the base the table no
+/// longer lists is left out: whatever replaced it is among those gained.
+/// Otherwise the commit writes the snapshot's manifests afresh.
+pub(crate) struct PreparedManifests {
+    snapshot_id: i64,
+    schema_id: i32,
+    default_partition_spec_id: i32,
+    /// The manifests the base listed.
+    base_manifest_paths: HashSet<String>,
+    /// The manifests the snapshot lists on top of the base.
+    manifests: Vec<ManifestFile>,
+    removed_files: Vec<RemovedFile>,
+    /// The manifests written to prepare.
+    written_manifest_paths: Vec<String>,
+    /// The files the snapshot removes and adds, which the commit that takes
+    /// the manifests has to remove and add as well.
+    deleted_paths: BTreeSet<String>,
+    added_paths: BTreeSet<String>,
+}
+
+/// The manifests a snapshot lists, as [`MergingSnapshotProducer`] produced
+/// them on top of a table.
+struct ProducedManifests {
+    /// The manifests the table's current snapshot lists.
+    base_manifest_paths: HashSet<String>,
+    manifests: Vec<ManifestFile>,
+    removed_files: Vec<RemovedFile>,
 }
 
 impl MergingSnapshotProducer {
@@ -459,7 +543,15 @@ impl MergingSnapshotProducer {
             check_duplicate: true,
             manifest_merge: false,
             manifest_counter: AtomicU64::new(0),
+            prepared: None,
+            is_prepared_taken: AtomicBool::new(false),
         }
+    }
+
+    /// Commit with `prepared`, the manifests written ahead for the files
+    /// this producer removes and adds.
+    pub(crate) fn set_prepared(&mut self, prepared: PreparedManifests) {
+        self.prepared = Some(prepared);
     }
 
     pub(crate) fn add_data_file(&mut self, file: DataFile) {
@@ -512,6 +604,10 @@ impl MergingSnapshotProducer {
 
     /// Produce manifests, compute summary, and commit a new snapshot. Every
     /// manifest and the manifest list written is recorded in `written_files`.
+    ///
+    /// The manifests written ahead are listed when they still stand on the
+    /// table ([`PreparedManifests`]); they are recorded in `written_files`
+    /// either way.
     pub(crate) async fn commit_snapshot(
         &self,
         table: &Table,
@@ -529,13 +625,104 @@ impl MergingSnapshotProducer {
             written_files,
         );
         snapshot_producer.validate_added_data_files()?;
+
+        if let Some(prepared) = &self.prepared
+            && !self.is_prepared_taken.swap(true, Ordering::Relaxed)
+        {
+            written_files.record_manifests(&prepared.written_manifest_paths);
+            self.validate_prepared_for_same_files(prepared)?;
+            if let Some(manifests) = prepared.list_on(table).await? {
+                let summary = self.build_summary(table, &prepared.removed_files)?;
+                return snapshot_producer
+                    .with_snapshot_id(prepared.snapshot_id)
+                    .commit_with_manifests(manifests, summary)
+                    .await;
+            }
+        }
+
+        if self.check_duplicate {
+            snapshot_producer.validate_duplicate_files().await?;
+        }
+        let produced = self
+            .produce_manifests(table, snapshot_producer.snapshot_id, written_files)
+            .await?;
+        let summary = self.build_summary(table, &produced.removed_files)?;
+        snapshot_producer
+            .commit_with_manifests(produced.manifests, summary)
+            .await
+    }
+
+    /// Write the manifests of the snapshot ahead of its commit, on top of
+    /// the snapshot `table` has now.
+    pub(crate) async fn prepare(&self, table: &Table) -> Result<PreparedManifests> {
+        self.validate_data_sequence_number(table)?;
+        let written_files = WrittenFiles::default();
+        let snapshot_producer = SnapshotProducer::new(
+            table,
+            self.commit_uuid,
+            HashMap::new(),
+            self.added_data_files.clone(),
+            &written_files,
+        );
+        snapshot_producer.validate_added_data_files()?;
         if self.check_duplicate {
             snapshot_producer.validate_duplicate_files().await?;
         }
         let snapshot_id = snapshot_producer.snapshot_id;
+        let produced = self
+            .produce_manifests(table, snapshot_id, &written_files)
+            .await?;
+        Ok(PreparedManifests {
+            snapshot_id,
+            schema_id: table.metadata().current_schema_id(),
+            default_partition_spec_id: table.metadata().default_partition_spec_id(),
+            base_manifest_paths: produced.base_manifest_paths,
+            manifests: produced.manifests,
+            removed_files: produced.removed_files,
+            written_manifest_paths: written_files.collect_manifest_paths(),
+            deleted_paths: self.collect_deleted_paths(),
+            added_paths: self.collect_added_paths(),
+        })
+    }
 
+    fn collect_deleted_paths(&self) -> BTreeSet<String> {
+        self.deleted_data_files
+            .iter()
+            .map(|file| file.file_path.clone())
+            .collect()
+    }
+
+    fn collect_added_paths(&self) -> BTreeSet<String> {
+        self.added_data_files
+            .iter()
+            .map(|file| file.file_path.clone())
+            .collect()
+    }
+
+    /// Refuse `prepared` when it was written for other files than this
+    /// producer removes and adds.
+    fn validate_prepared_for_same_files(&self, prepared: &PreparedManifests) -> Result<()> {
+        if prepared.deleted_paths != self.collect_deleted_paths()
+            || prepared.added_paths != self.collect_added_paths()
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "The manifests written ahead are of other files than the commit removes and adds",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The manifests the snapshot `snapshot_id` lists on top of `table`,
+    /// each one written.
+    async fn produce_manifests(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+        written_files: &WrittenFiles,
+    ) -> Result<ProducedManifests> {
         // 1. Load existing manifests from the current snapshot.
-        let existing_manifests = match table.metadata().current_snapshot() {
+        let existing_manifests: Vec<ManifestFile> = match table.metadata().current_snapshot() {
             Some(snapshot) => {
                 let manifest_list = table.manifest_list_reader(snapshot).load().await?;
                 manifest_list
@@ -548,27 +735,23 @@ impl MergingSnapshotProducer {
             }
             None => Vec::new(),
         };
+        let base_manifest_paths = existing_manifests
+            .iter()
+            .map(|manifest| manifest.manifest_path.clone())
+            .collect();
 
         // 2. Filter existing manifests — remove deleted file entries.
-        let (mut filtered_manifests, removed_collector) = self
+        let (filtered_manifests, removed_files) = self
             .filter_manager
-            .filter_manifests(
-                table,
-                existing_manifests,
-                snapshot_id,
-                self.commit_uuid,
-                &self.manifest_counter,
-                written_files,
-            )
+            .filter_manifests(table, existing_manifests)
             .await?;
 
-        // 3. Write a new manifest for added files.
+        // 3. A new manifest for added files.
         let mut added_manifests = Vec::new();
         if !self.added_data_files.is_empty() {
-            added_manifests.push(
-                self.write_added_manifest(table, snapshot_id, written_files)
-                    .await?,
-            );
+            added_manifests.push(SnapshotManifest::Unwritten(
+                self.build_added_manifest(table, snapshot_id),
+            ));
         }
 
         // 4. Merge small data manifests, or list the added manifest last.
@@ -584,17 +767,21 @@ impl MergingSnapshotProducer {
                 )
                 .await?
         } else {
-            filtered_manifests.extend(added_manifests);
-            filtered_manifests
+            ManifestMergeManager::list_unmerged(
+                table,
+                snapshot_id,
+                added_manifests,
+                filtered_manifests,
+                || self.generate_manifest_file_path(table),
+                written_files,
+            )
+            .await?
         };
-
-        // 5. Compute summary (added + removed).
-        let summary = self.build_summary(table, removed_collector)?;
-
-        // 6. Delegate to SnapshotProducer for manifest list + snapshot creation.
-        snapshot_producer
-            .commit_with_manifests(manifests, summary)
-            .await
+        Ok(ProducedManifests {
+            base_manifest_paths,
+            manifests,
+            removed_files,
+        })
     }
 
     /// The path of the next manifest this producer writes.
@@ -608,59 +795,64 @@ impl MergingSnapshotProducer {
         ))
     }
 
-    async fn write_added_manifest(
-        &self,
-        table: &Table,
-        snapshot_id: i64,
-        written_files: &WrittenFiles,
-    ) -> Result<ManifestFile> {
-        let new_manifest_path = self.generate_manifest_file_path(table)?;
-        let output_file = written_files.new_manifest_output(table.file_io(), new_manifest_path)?;
-        let schema = table.metadata().current_schema().clone();
-        let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
-
-        let mut writer = new_manifest_writer(
-            table,
-            output_file,
-            Some(snapshot_id),
-            ManifestContentType::Data,
-            schema,
-            partition_spec,
-        )?;
+    /// The manifest of the added files, under the default partition spec,
+    /// not written yet.
+    fn build_added_manifest(&self, table: &Table, snapshot_id: i64) -> UnwrittenManifest {
+        /// About what one added file takes in a manifest.
+        const ESTIMATED_ENTRY_BYTES: u64 = 512;
 
         let format_version = table.metadata().format_version();
-        for data_file in &self.added_data_files {
-            if let Some(sequence_number) = self.data_sequence_number {
-                writer.add_file(data_file.clone(), sequence_number)?;
-                continue;
-            }
-            let entry_builder = ManifestEntry::builder()
-                .status(ManifestStatus::Added)
-                .data_file(data_file.clone());
-            let entry = if format_version == FormatVersion::V1 {
-                // V1 requires snapshot_id on each entry.
-                entry_builder.snapshot_id(snapshot_id).build()
-            } else {
-                entry_builder.build()
-            };
-            writer.add_entry(entry)?;
+        let entries = self
+            .added_data_files
+            .iter()
+            .map(|data_file| {
+                let entry_builder = ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(data_file.clone())
+                    // A sequence number below zero is none: the file
+                    // inherits the snapshot's.
+                    .sequence_number_opt(
+                        self.data_sequence_number
+                            .filter(|sequence_number| *sequence_number >= 0),
+                    );
+                if format_version == FormatVersion::V1 {
+                    // V1 requires snapshot_id on each entry.
+                    entry_builder.snapshot_id(snapshot_id).build()
+                } else {
+                    entry_builder.build()
+                }
+            })
+            .collect();
+        UnwrittenManifest {
+            partition_spec_id: table.metadata().default_partition_spec_id(),
+            entries,
+            estimated_length: self.added_data_files.len() as u64 * ESTIMATED_ENTRY_BYTES,
         }
-
-        writer.write_manifest_file().await
     }
 
-    fn build_summary(
-        &self,
-        table: &Table,
-        removed_collector: SnapshotSummaryCollector,
-    ) -> Result<Summary> {
+    fn build_summary(&self, table: &Table, removed_files: &[RemovedFile]) -> Result<Summary> {
         let table_metadata = table.metadata_ref();
         let schema = table_metadata.current_schema().clone();
         let partition_spec = table_metadata.default_partition_spec().clone();
 
-        // Add to the filter's collector rather than merging two: `merge` drops
-        // partition metrics unless both sides trust them, and neither does.
-        let mut collector = removed_collector;
+        // Add to the collector of the removed files rather than merging two:
+        // `merge` drops partition metrics unless both sides trust them, and
+        // neither does.
+        let mut collector = SnapshotSummaryCollector::default();
+        for removed in removed_files {
+            let removed_spec = table_metadata
+                .partition_spec_by_id(removed.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Manifest references unknown partition spec {}",
+                            removed.partition_spec_id
+                        ),
+                    )
+                })?;
+            collector.remove_file(&removed.file, schema.clone(), removed_spec.clone());
+        }
         collector.set_partition_summary_limit(
             table_metadata
                 .properties()

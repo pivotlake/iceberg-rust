@@ -31,10 +31,16 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::spec::{DataFile, ManifestContentType, Operation};
 use crate::table::Table;
-use crate::transaction::merging::MergingSnapshotProducer;
+use crate::transaction::merging::{MergingSnapshotProducer, PreparedManifests};
 use crate::transaction::written_files::WrittenFiles;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
+
+/// The manifests of a rewrite's snapshot, written ahead of its commit by
+/// [`RewriteFilesAction::prepare`].
+pub struct PreparedRewrite {
+    manifests: PreparedManifests,
+}
 
 /// A transaction action that rewrites (replaces) data files.
 ///
@@ -158,6 +164,35 @@ impl RewriteFilesAction {
     /// snapshot id, sequence numbers and `first_row_id` they had.
     pub fn with_manifest_merge(mut self, v: bool) -> Self {
         self.producer.set_manifest_merge(v);
+        self
+    }
+
+    /// Write the manifests of the rewrite's snapshot now, on top of the
+    /// snapshot `table` has, so that the commit of an action that removes and
+    /// adds the same files only has to list them
+    /// ([`with_prepared`](Self::with_prepared)). Reading and rewriting the
+    /// manifests that list the removed files is most of what a rewrite does,
+    /// and this way it is done before the commit, not during it.
+    pub async fn prepare(&self, table: &Table) -> Result<PreparedRewrite> {
+        self.validate()?;
+        self.validate_no_new_deletes(table).await?;
+        Ok(PreparedRewrite {
+            manifests: self.producer.prepare(table).await?,
+        })
+    }
+
+    /// Commit with `prepared`, the manifests written ahead by an action that
+    /// removes and adds the same files as this one.
+    ///
+    /// The commit lists them as they are when the table still lists every
+    /// manifest they took the place of and still has the schema and the
+    /// default partition spec they were written under: what the table
+    /// gained since, it lists before them. Otherwise it writes the
+    /// snapshot's manifests afresh, as without them. The manifests written
+    /// ahead that the commit does not list are deleted with whatever else it
+    /// wrote and left unreferenced.
+    pub fn with_prepared(mut self, prepared: PreparedRewrite) -> Self {
+        self.producer.set_prepared(prepared.manifests);
         self
     }
 
@@ -1459,6 +1494,123 @@ mod tests {
             assert_eq!(carried.snapshot_id(), original.snapshot_id());
             assert_eq!(carried.sequence_number(), original.sequence_number());
         }
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_prepared_ahead_lists_its_manifests_after_those_the_table_gained() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = set_table_properties(&catalog, &table, &[(MIN_COUNT_TO_MERGE, "3")]).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let f4 = make_data_file(&table, "test/4.parquet", 10, 100);
+        let f5 = make_data_file(&table, "test/5.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone(), f2]).await;
+        let table = append_files(&catalog, &table, vec![f3]).await;
+        let rewrite = |table: &Table| {
+            Transaction::new(table)
+                .rewrite_files()
+                .with_manifest_merge(true)
+                .delete_file(f1.clone())
+                .add_file(f4.clone())
+        };
+        let prepared = rewrite(&table).prepare(&table).await.unwrap();
+        let table = append_files(&catalog, &table, vec![f5]).await;
+        // An append without merging lists the manifest it writes last.
+        let gained_manifest_path = load_current_manifests(&table)
+            .await
+            .last()
+            .unwrap()
+            .manifest_path
+            .clone();
+
+        let tx = Transaction::new(&table);
+        let action = rewrite(&table).with_prepared(prepared);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifests = load_current_manifests(&table).await;
+        let entries = load_current_entries(&table).await;
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].manifest_path, gained_manifest_path);
+        assert_eq!(collect_live_paths(&entries), [
+            "test/2.parquet",
+            "test/3.parquet",
+            "test/4.parquet",
+            "test/5.parquet"
+        ]);
+        let removed = find_entry_by_path(&entries, "test/1.parquet");
+        assert_eq!(removed.status(), ManifestStatus::Deleted);
+        assert_eq!(removed.snapshot_id(), Some(snapshot.snapshot_id()));
+        let added = find_entry_by_path(&entries, "test/4.parquet");
+        assert_eq!(added.status(), ManifestStatus::Added);
+        assert_eq!(added.sequence_number(), Some(snapshot.sequence_number()));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_prepared_ahead_writes_afresh_once_a_manifest_it_replaced_is_gone() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let f4 = make_data_file(&table, "test/4.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone(), f2.clone()]).await;
+        let rewrite = |table: &Table| {
+            Transaction::new(table)
+                .rewrite_files()
+                .delete_file(f1.clone())
+                .add_file(f4.clone())
+        };
+        let prepared = rewrite(&table).prepare(&table).await.unwrap();
+        let tx = Transaction::new(&table);
+        let other_rewrite = tx.rewrite_files().delete_file(f2).add_file(f3);
+        let table = other_rewrite
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = rewrite(&table).with_prepared(prepared);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), [
+            "test/3.parquet",
+            "test/4.parquet"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_refuses_manifests_prepared_ahead_for_other_files() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let f4 = make_data_file(&table, "test/4.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone(), f2.clone()]).await;
+        let tx = Transaction::new(&table);
+        let prepared_rewrite = tx.rewrite_files().delete_file(f1).add_file(f3);
+        let prepared = prepared_rewrite.prepare(&table).await.unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file(f2)
+            .add_file(f4)
+            .with_prepared(prepared);
+        let error = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 
     /// A rewrite that filters a manifest and merges it in the same commit
