@@ -19,6 +19,8 @@ mod _serde;
 
 mod data_file;
 pub use data_file::*;
+mod encoded;
+pub use encoded::*;
 mod entry;
 pub use entry::*;
 mod metadata;

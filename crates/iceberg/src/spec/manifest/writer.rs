@@ -18,8 +18,9 @@
 use std::cmp::min;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use apache_avro::{Writer as AvroWriter, to_value};
+use apache_avro::Writer as AvroWriter;
 use bytes::Bytes;
 use itertools::Itertools;
 use serde_json::to_vec;
@@ -31,11 +32,11 @@ use super::{
 use crate::encryption::EncryptedOutputFile;
 use crate::error::Result;
 use crate::io::{FileWrite, OutputFile};
-use crate::spec::manifest::_serde::{ManifestEntryV1, ManifestEntryV2};
-use crate::spec::manifest::{manifest_schema_v1, manifest_schema_v2};
+use crate::spec::manifest::encoded::write_long;
+use crate::spec::manifest::{EncodedEntry, EncodedManifest, EntryCodec};
 use crate::spec::{
     DataContentType, DataFile, FieldSummary, ManifestEntry, ManifestFile, ManifestMetadata,
-    ManifestStatus, PrimitiveLiteral, SchemaRef, StructType, Type,
+    ManifestStatus, PrimitiveLiteral, SchemaRef, StructType,
 };
 use crate::{Error, ErrorKind};
 
@@ -213,10 +214,16 @@ pub struct ManifestWriter {
 
     key_metadata: Option<Vec<u8>>,
 
-    manifest_entries: Vec<ManifestEntry>,
+    /// The entries, each encoded as it was added.
+    manifest_entries: Vec<EncodedEntry>,
+    /// What encodes the entries, built when the first one is added.
+    codec: Option<Arc<EntryCodec>>,
 
     metadata: ManifestMetadata,
 }
+
+/// About how many bytes of entries one block of a manifest holds.
+const MANIFEST_BLOCK_BYTES: usize = 64 * 1024;
 
 impl ManifestWriter {
     /// Create a new manifest writer.
@@ -242,6 +249,7 @@ impl ManifestWriter {
             min_seq_num: None,
             key_metadata,
             manifest_entries: Vec::new(),
+            codec: None,
             metadata,
         }
     }
@@ -255,7 +263,7 @@ impl ManifestWriter {
             .iter()
             .map(|f| PartitionFieldStats::new(f.field_type.as_primitive_type().unwrap().clone()))
             .collect();
-        for partition in self.manifest_entries.iter().map(|e| &e.data_file.partition) {
+        for partition in self.manifest_entries.iter().map(|e| e.partition()) {
             for (literal, stat) in partition.iter().zip_eq(field_stats.iter_mut()) {
                 let primitive_literal = literal.map(|v| v.as_primitive_literal().unwrap());
                 stat.update(primitive_literal)?;
@@ -265,29 +273,31 @@ impl ManifestWriter {
     }
 
     fn check_data_file(&self, data_file: &DataFile) -> Result<()> {
+        self.check_content(data_file.content, data_file.file_path())
+    }
+
+    fn check_content(&self, content: DataContentType, file_path: &str) -> Result<()> {
         match self.metadata.content {
             ManifestContentType::Data => {
-                if data_file.content != DataContentType::Data {
+                if content != DataContentType::Data {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
                             "Date file at path {} with manifest content type `data`, should have DataContentType `Data`, but has `{:?}`",
-                            data_file.file_path(),
-                            data_file.content
+                            file_path, content
                         ),
                     ));
                 }
             }
             ManifestContentType::Deletes => {
-                if data_file.content != DataContentType::EqualityDeletes
-                    && data_file.content != DataContentType::PositionDeletes
+                if content != DataContentType::EqualityDeletes
+                    && content != DataContentType::PositionDeletes
                 {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
                             "Date file at path {} with manifest content type `deletes`, should have DataContentType `Data`, but has `{:?}`",
-                            data_file.file_path(),
-                            data_file.content
+                            file_path, content
                         ),
                     ));
                 }
@@ -336,6 +346,7 @@ impl ManifestWriter {
     /// Add a delete manifest entry. This method will update following status of the entry:
     /// - Update the entry status to `Deleted`
     /// - Set the snapshot id to the current snapshot id
+    #[cfg(test)]
     pub(crate) fn add_delete_entry(&mut self, mut entry: ManifestEntry) -> Result<()> {
         self.check_data_file(&entry.data_file)?;
         entry.status = ManifestStatus::Deleted;
@@ -367,6 +378,7 @@ impl ManifestWriter {
 
     /// Add an existing manifest entry. This method will update following status of the entry:
     /// - Update the entry status to `Existing`
+    #[cfg(test)]
     pub(crate) fn add_existing_entry(&mut self, mut entry: ManifestEntry) -> Result<()> {
         self.check_data_file(&entry.data_file)?;
         entry.status = ManifestStatus::Existing;
@@ -395,7 +407,57 @@ impl ManifestWriter {
         Ok(())
     }
 
+    /// What encodes the entries of the manifest.
+    fn load_codec(&mut self) -> Result<Arc<EntryCodec>> {
+        if let Some(codec) = &self.codec {
+            return Ok(Arc::clone(codec));
+        }
+        let codec = Arc::new(EntryCodec::new(&self.metadata)?);
+        self.codec = Some(Arc::clone(&codec));
+        Ok(codec)
+    }
+
+    /// Add `entries`, which `encoded_by` encoded, each as its status says:
+    /// an added entry takes the manifest's snapshot id and leaves its file
+    /// sequence number to be inherited, a deleted one takes the manifest's
+    /// snapshot id, and an existing one is written as it is. The entries are
+    /// written as the bytes they hold, so `encoded_by` must lay an entry out
+    /// as this manifest does.
+    pub(crate) fn add_encoded_entries(
+        &mut self,
+        entries: impl IntoIterator<Item = EncodedEntry>,
+        encoded_by: &EntryCodec,
+    ) -> Result<()> {
+        if !self.load_codec()?.has_layout_of(encoded_by) {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "Manifest entries were encoded for another layout than the manifest's",
+            ));
+        }
+        for mut entry in entries {
+            self.check_content(entry.content_type(), entry.file_path())?;
+            match entry.status {
+                ManifestStatus::Added => {
+                    entry.snapshot_id = self.snapshot_id;
+                    entry.file_sequence_number = None;
+                    if !entry.sequence_number.is_some_and(|n| n >= 0) {
+                        entry.sequence_number = None;
+                    }
+                }
+                ManifestStatus::Deleted => entry.snapshot_id = self.snapshot_id,
+                ManifestStatus::Existing => {}
+            }
+            self.add_encoded_entry_inner(entry)?;
+        }
+        Ok(())
+    }
+
     fn add_entry_inner(&mut self, entry: ManifestEntry) -> Result<()> {
+        let entry = self.load_codec()?.encode(entry)?;
+        self.add_encoded_entry_inner(entry)
+    }
+
+    fn add_encoded_entry_inner(&mut self, entry: EncodedEntry) -> Result<()> {
         // An entry that is not added cannot inherit its data sequence number,
         // so it has to state it. Its file sequence number may be unknown: a
         // file committed by a writer that did not record one has none.
@@ -412,15 +474,15 @@ impl ManifestWriter {
         match entry.status {
             ManifestStatus::Added => {
                 self.added_files += 1;
-                self.added_rows += entry.data_file.record_count;
+                self.added_rows += entry.record_count();
             }
             ManifestStatus::Deleted => {
                 self.deleted_files += 1;
-                self.deleted_rows += entry.data_file.record_count;
+                self.deleted_rows += entry.record_count();
             }
             ManifestStatus::Existing => {
                 self.existing_files += 1;
-                self.existing_rows += entry.data_file.record_count;
+                self.existing_rows += entry.record_count();
             }
         }
         if entry.is_alive()
@@ -433,22 +495,15 @@ impl ManifestWriter {
     }
 
     /// Write manifest file and return it.
+    ///
+    /// The entries were encoded as they were added, so the file is put
+    /// together from their bytes: the header an Avro writer gives a file of
+    /// the entries' schema, then the entries in blocks.
     pub async fn write_manifest_file(mut self) -> Result<ManifestFile> {
-        // Create the avro writer
-        let partition_type = self
-            .metadata
-            .partition_spec
-            .partition_type(&self.metadata.schema)?;
-        // Wrap once and reuse for every entry so the per-entry conversion does
-        // not rebuild the partition type's field-name lookup on each call.
-        let partition_struct_type = Type::Struct(partition_type.clone());
+        let codec = self.load_codec()?;
+        let partition_type = codec.partition_type().clone();
         let table_schema = &self.metadata.schema;
-        let avro_schema = match self.metadata.format_version {
-            FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
-            // Manifest schema did not change between V2 and V3
-            FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type)?,
-        };
-        let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new());
+        let mut avro_writer = AvroWriter::new(codec.avro_schema(), Vec::new());
         avro_writer.add_user_metadata(
             "schema".to_string(),
             to_vec(table_schema).map_err(|err| {
@@ -484,28 +539,35 @@ impl ManifestWriter {
         }
 
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
-        // Write manifest entries
-        for entry in std::mem::take(&mut self.manifest_entries) {
-            let value = match self.metadata.format_version {
-                FormatVersion::V1 => {
-                    to_value(ManifestEntryV1::try_from(entry, &partition_struct_type)?)?
-                        .resolve(&avro_schema)?
-                }
-                // Manifest entry format did not change between V2 and V3
-                FormatVersion::V2 | FormatVersion::V3 => {
-                    to_value(ManifestEntryV2::try_from(entry, &partition_struct_type)?)?
-                        .resolve(&avro_schema)?
-                }
-            };
-
-            avro_writer.append(value)?;
+        // A writer nothing was appended to gives the header alone, which
+        // ends with the marker every block is followed by.
+        let mut content = avro_writer.into_inner()?;
+        let sync_marker: [u8; 16] = content[content.len() - 16..]
+            .try_into()
+            .expect("an Avro header ends with its sync marker");
+        let entries = std::mem::take(&mut self.manifest_entries);
+        let mut block = Vec::with_capacity(MANIFEST_BLOCK_BYTES + 4096);
+        let mut entries_in_block = 0i64;
+        for (position, entry) in entries.iter().enumerate() {
+            codec.write_entry(entry, &mut block);
+            entries_in_block += 1;
+            if block.len() >= MANIFEST_BLOCK_BYTES || position + 1 == entries.len() {
+                write_long(&mut content, entries_in_block);
+                write_long(&mut content, block.len() as i64);
+                content.extend_from_slice(&block);
+                content.extend_from_slice(&sync_marker);
+                block.clear();
+                entries_in_block = 0;
+            }
         }
 
-        let content = avro_writer.into_inner()?;
         let length = content.len();
         let mut writer = self.writer_future.await?;
         writer.write(Bytes::from(content)).await?;
         writer.close().await?;
+        // A later commit that carries these entries over, or a reader of
+        // the manifest, takes them from here.
+        EncodedManifest::hold(&self.location, self.metadata.clone(), &codec, entries);
 
         Ok(ManifestFile {
             manifest_path: self.location,

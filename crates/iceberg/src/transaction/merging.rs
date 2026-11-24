@@ -24,6 +24,7 @@
 
 use std::cmp::Ordering as ValueOrdering;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::{StreamExt, stream};
@@ -32,10 +33,11 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::io::OutputFile;
 use crate::spec::{
-    DataFile, DataFileFormat, Datum, FieldSummary, FormatVersion, Literal, Manifest,
-    ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus, ManifestWriter,
-    ManifestWriterBuilder, Operation, PartitionSpec, SchemaRef, SnapshotSummaryCollector,
-    StructType, Summary, TableProperties, Type, update_snapshot_summaries,
+    DataFile, DataFileFormat, Datum, EncodedEntry, EncodedManifest, EntryCodec, FieldSummary,
+    FormatVersion, Literal, Manifest, ManifestContentType, ManifestEntry, ManifestFile,
+    ManifestStatus, ManifestWriter, ManifestWriterBuilder, Operation, PartitionSpec, SchemaRef,
+    SnapshotSummaryCollector, StructType, Summary, TableProperties, Type,
+    update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -214,22 +216,54 @@ impl ManifestFilterManager {
         // What takes the place of a manifest that lists a file to delete, by
         // the manifest's position: `None` when nothing is left to say about it.
         let mut filtered: HashMap<usize, Option<UnwrittenManifest>> = HashMap::new();
+        // What encodes the entries of the manifests of each partition spec:
+        // none for a spec the table can write no manifest under.
+        let mut codecs: HashMap<i32, Option<Arc<EntryCodec>>> = HashMap::new();
         for candidates in [named, others] {
             let reads: Vec<_> = candidates
                 .into_iter()
-                .map(|position| read_candidate(table, &manifests[position], position))
+                .map(|position| {
+                    let partition_spec_id = manifests[position].partition_spec_id;
+                    let codec = codecs
+                        .entry(partition_spec_id)
+                        .or_insert_with(|| {
+                            EntryCodec::of_table(table, partition_spec_id).map(Arc::new)
+                        })
+                        .clone();
+                    read_candidate(table, &manifests[position], position, codec)
+                })
                 .collect();
             let mut reads = stream::iter(reads).buffered(MANIFEST_READ_CONCURRENCY);
             while found_paths.len() < self.deleted_files.len() {
-                let Some((position, manifest)) = reads.next().await else {
+                let Some((position, entries)) = reads.next().await else {
                     break;
                 };
                 let manifest_file = &manifests[position];
-                let manifest = manifest?;
+                let (entries, codec) = match entries? {
+                    CandidateEntries::Encoded(entries, codec) => (entries, codec),
+                    CandidateEntries::Decoded(manifest) => {
+                        let has_deletes = manifest.entries().iter().any(|e| {
+                            e.is_alive() && self.deleted_files.contains_key(e.file_path())
+                        });
+                        if !has_deletes {
+                            continue;
+                        }
+                        // After partition evolution, old manifests may carry
+                        // a non-default spec: the rewritten manifest keeps
+                        // the manifest's own spec, which the table must
+                        // still be able to write under.
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Manifest references unknown partition spec {}",
+                                manifest_file.partition_spec_id
+                            ),
+                        ));
+                    }
+                };
 
                 // Check whether this manifest contains any files we want to delete.
-                let has_deletes = manifest
-                    .entries()
+                let has_deletes = entries
                     .iter()
                     .any(|e| e.is_alive() && self.deleted_files.contains_key(e.file_path()));
 
@@ -238,67 +272,48 @@ impl ManifestFilterManager {
                     continue;
                 }
 
-                // After partition evolution, old manifests may carry a
-                // non-default spec: the rewritten manifest keeps the
-                // manifest's own spec so that it stays valid.
-                if table
-                    .metadata()
-                    .partition_spec_by_id(manifest_file.partition_spec_id)
-                    .is_none()
-                {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Manifest references unknown partition spec {}",
-                            manifest_file.partition_spec_id
-                        ),
-                    ));
-                }
-
                 // Rewrite: keep surviving entries as EXISTING, and record the
                 // removed ones as DELETED so that the file they name can be
-                // cleaned up when this snapshot expires.
-                let mut surviving_entries: Vec<ManifestEntry> = Vec::new();
-                let mut removed_entries: Vec<ManifestEntry> = Vec::new();
-                for entry in manifest.entries() {
-                    if entry.is_alive() && self.deleted_files.contains_key(entry.file_path()) {
+                // cleaned up when this snapshot expires. Either is carried as
+                // the bytes it was read as.
+                let mut surviving_entries: Vec<EncodedEntry> = Vec::new();
+                let mut removed_entries: Vec<EncodedEntry> = Vec::new();
+                for mut entry in entries {
+                    if !entry.is_alive() {
+                        // Already-deleted entries (status == Deleted) are dropped.
+                        continue;
+                    }
+                    if self.deleted_files.contains_key(entry.file_path()) {
                         found_paths.insert(entry.file_path().to_string());
                         removed_files.push(RemovedFile {
-                            file: entry.data_file().clone(),
+                            file: codec.decode(&entry)?.data_file,
                             partition_spec_id: manifest_file.partition_spec_id,
                         });
                         // The manifest writer stamps the removing snapshot
                         // on the entry and keeps the file's own sequence
                         // numbers, which is what an expiring reader needs to
                         // attribute the removal.
-                        let mut removed_entry = entry.as_ref().clone();
-                        removed_entry.status = ManifestStatus::Deleted;
-                        removed_entries.push(removed_entry);
-                    } else if entry.is_alive() {
+                        entry.status = ManifestStatus::Deleted;
+                        removed_entries.push(entry);
+                    } else {
                         // Surviving entry — re-emit as EXISTING with original ids preserved.
-                        let seq = entry.sequence_number().ok_or_else(|| {
-                            Error::new(
+                        if entry.sequence_number().is_none() {
+                            return Err(Error::new(
                                 ErrorKind::DataInvalid,
                                 format!(
                                     "Manifest entry for {} is missing sequence_number",
                                     entry.file_path()
                                 ),
-                            )
-                        })?;
-                        let existing = ManifestEntry::builder()
-                            .status(ManifestStatus::Existing)
-                            .snapshot_id(
-                                entry
-                                    .snapshot_id()
-                                    .unwrap_or(manifest_file.added_snapshot_id),
-                            )
-                            .sequence_number(seq)
-                            .file_sequence_number_opt(entry.file_sequence_number)
-                            .data_file(entry.data_file().clone())
-                            .build();
-                        surviving_entries.push(existing);
+                            ));
+                        }
+                        entry.status = ManifestStatus::Existing;
+                        entry.snapshot_id = Some(
+                            entry
+                                .snapshot_id()
+                                .unwrap_or(manifest_file.added_snapshot_id),
+                        );
+                        surviving_entries.push(entry);
                     }
-                    // Already-deleted entries (status == Deleted) are dropped.
                 }
 
                 if surviving_entries.is_empty() && removed_entries.is_empty() {
@@ -315,6 +330,7 @@ impl ManifestFilterManager {
                     Some(UnwrittenManifest {
                         partition_spec_id: manifest_file.partition_spec_id,
                         entries: surviving_entries,
+                        codec,
                         estimated_length: manifest_file.manifest_length.max(0) as u64,
                     }),
                 );
@@ -355,15 +371,35 @@ impl ManifestFilterManager {
     }
 }
 
+/// The entries of a manifest being filtered.
+enum CandidateEntries {
+    /// As the bytes the manifest that takes its place is written from, with
+    /// what encoded them.
+    Encoded(Vec<EncodedEntry>, Arc<EntryCodec>),
+    /// Decoded, for a manifest the table can write no manifest in place of.
+    Decoded(Manifest),
+}
+
 /// Read `manifest_file`, the manifest at `position` of the manifests being
-/// filtered.
+/// filtered: its entries as `codec` lays them out, or the manifest decoded
+/// when the table has no codec for it.
 async fn read_candidate(
     table: &Table,
     manifest_file: &ManifestFile,
     position: usize,
-) -> (usize, Result<Manifest>) {
-    let manifest = table.manifest_reader().read(manifest_file).await;
-    (position, manifest)
+    codec: Option<Arc<EntryCodec>>,
+) -> (usize, Result<CandidateEntries>) {
+    let entries = match codec {
+        Some(codec) => EncodedManifest::load_entries(table, manifest_file, &codec, false)
+            .await
+            .map(|entries| CandidateEntries::Encoded(entries, codec)),
+        None => table
+            .manifest_reader()
+            .read(manifest_file)
+            .await
+            .map(CandidateEntries::Decoded),
+    };
+    (position, entries)
 }
 
 /// Whether a manifest with the partition summaries `summaries`, one for each
@@ -758,7 +794,7 @@ impl MergingSnapshotProducer {
         let mut added_manifests = Vec::new();
         if !self.added_data_files.is_empty() {
             added_manifests.push(SnapshotManifest::Unwritten(
-                self.build_added_manifest(table, snapshot_id),
+                self.build_added_manifest(table, snapshot_id)?,
             ));
         }
 
@@ -805,11 +841,20 @@ impl MergingSnapshotProducer {
 
     /// The manifest of the added files, under the default partition spec,
     /// not written yet.
-    fn build_added_manifest(&self, table: &Table, snapshot_id: i64) -> UnwrittenManifest {
+    fn build_added_manifest(&self, table: &Table, snapshot_id: i64) -> Result<UnwrittenManifest> {
         /// About what one added file takes in a manifest.
         const ESTIMATED_ENTRY_BYTES: u64 = 512;
 
         let format_version = table.metadata().format_version();
+        let partition_spec_id = table.metadata().default_partition_spec_id();
+        let codec = Arc::new(
+            EntryCodec::of_table(table, partition_spec_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "The default partition spec does not bind to the table's schema",
+                )
+            })?,
+        );
         let entries = self
             .added_data_files
             .iter()
@@ -823,19 +868,21 @@ impl MergingSnapshotProducer {
                         self.data_sequence_number
                             .filter(|sequence_number| *sequence_number >= 0),
                     );
-                if format_version == FormatVersion::V1 {
+                let entry = if format_version == FormatVersion::V1 {
                     // V1 requires snapshot_id on each entry.
                     entry_builder.snapshot_id(snapshot_id).build()
                 } else {
                     entry_builder.build()
-                }
+                };
+                codec.encode(entry)
             })
-            .collect();
-        UnwrittenManifest {
-            partition_spec_id: table.metadata().default_partition_spec_id(),
+            .collect::<Result<Vec<_>>>()?;
+        Ok(UnwrittenManifest {
+            partition_spec_id,
             entries,
+            codec,
             estimated_length: self.added_data_files.len() as u64 * ESTIMATED_ENTRY_BYTES,
-        }
+        })
     }
 
     fn build_summary(&self, table: &Table, removed_files: &[RemovedFile]) -> Result<Summary> {

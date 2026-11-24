@@ -24,12 +24,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::sync::Arc;
 
 use futures::future::try_join_all;
 
 use crate::error::Result;
 use crate::spec::{
-    Manifest, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus, ManifestWriter,
+    EncodedEntry, EncodedManifest, EntryCodec, ManifestContentType, ManifestFile, ManifestStatus,
     TableProperties,
 };
 use crate::table::Table;
@@ -103,13 +104,16 @@ impl SnapshotManifest {
 /// The entries of a data manifest a commit has not written: the files it
 /// adds, or what is left of a manifest it removes files from. Merged with
 /// other manifests, its entries go straight into the merged manifest, so
-/// they are neither written nor read back on their own.
+/// they are neither written nor read back on their own. The entries are held
+/// as the bytes a manifest stores them in, so writing them encodes nothing.
 pub(crate) struct UnwrittenManifest {
     pub(crate) partition_spec_id: i32,
     /// Each entry with the status the manifest carries it under: `ADDED` for
     /// a file the snapshot adds, `DELETED` for one it removes, `EXISTING`
     /// for any other.
-    pub(crate) entries: Vec<ManifestEntry>,
+    pub(crate) entries: Vec<EncodedEntry>,
+    /// What encoded the entries.
+    pub(crate) codec: Arc<EntryCodec>,
     /// About how long the manifest would be, which bin-packing goes by.
     pub(crate) estimated_length: u64,
 }
@@ -143,19 +147,8 @@ impl UnwrittenManifest {
             table.metadata().current_schema().clone(),
             partition_spec.as_ref().clone(),
         )?;
-        for entry in &self.entries {
-            write_entry(&mut writer, entry.clone())?;
-        }
+        writer.add_encoded_entries(self.entries.iter().cloned(), &self.codec)?;
         writer.write_manifest_file().await
-    }
-}
-
-/// Add `entry` to the manifest `writer` writes, as its status says.
-fn write_entry(writer: &mut ManifestWriter, entry: ManifestEntry) -> Result<()> {
-    match entry.status {
-        ManifestStatus::Added => writer.add_entry(entry),
-        ManifestStatus::Existing => writer.add_existing_entry(entry),
-        ManifestStatus::Deleted => writer.add_delete_entry(entry),
     }
 }
 
@@ -385,27 +378,43 @@ impl ManifestMergeManager {
             return Ok(None);
         };
 
+        let Some(codec) = EntryCodec::of_table(table, bin[0].partition_spec_id()) else {
+            return Ok(None);
+        };
+
         // Only the manifests that are written are read; the entries of the
-        // others are at hand.
+        // others are at hand. Everything an entry inherits is resolved as it
+        // is read: the snapshot that added its file, its sequence numbers
+        // and, on a table with row lineage, its `first_row_id`. A manifest
+        // the commit in progress wrote is not in a manifest list yet and has
+        // no `first_row_id` of its own, so its entries are read with the
+        // `first_row_id` they state.
         let mut written_inputs = try_join_all(bin.iter().filter_map(|manifest| match manifest {
-            SnapshotManifest::Written(manifest_file) => {
-                Some(read_merge_input(table, snapshot_id, manifest_file))
-            }
+            SnapshotManifest::Written(manifest_file) => Some(EncodedManifest::load_entries(
+                table,
+                manifest_file,
+                &codec,
+                manifest_file.added_snapshot_id == snapshot_id,
+            )),
             SnapshotManifest::Unwritten(_) => None,
         }))
         .await?
         .into_iter();
         let mut merged_entries = Vec::new();
         for manifest in bin {
-            let entries: Vec<ManifestEntry> = match manifest {
+            let entries: Vec<EncodedEntry> = match manifest {
                 SnapshotManifest::Written(_) => written_inputs
                     .next()
                     .expect("every written manifest of the bin was read")
-                    .entries()
-                    .iter()
+                    .into_iter()
                     .filter_map(|entry| to_merged_entry(entry, snapshot_id))
                     .collect(),
-                SnapshotManifest::Unwritten(manifest) => manifest.entries.clone(),
+                SnapshotManifest::Unwritten(manifest) => {
+                    if !manifest.codec.has_layout_of(&codec) {
+                        return Ok(None);
+                    }
+                    manifest.entries.clone()
+                }
             };
             for merged_entry in entries {
                 if merged_entry.status != ManifestStatus::Added
@@ -425,9 +434,7 @@ impl ManifestMergeManager {
             schema.clone(),
             partition_spec.as_ref().clone(),
         )?;
-        for entry in merged_entries {
-            write_entry(&mut writer, entry)?;
-        }
+        writer.add_encoded_entries(merged_entries, &codec)?;
         writer.write_manifest_file().await.map(Some)
     }
 }
@@ -458,29 +465,7 @@ fn pack_from_end(lengths: &[u64], target_size_bytes: u64) -> Vec<Range<usize>> {
     bins
 }
 
-/// Read `manifest_file` with everything its entries inherit resolved: the
-/// snapshot that added a file, its sequence numbers and, on a table with row
-/// lineage, its `first_row_id`.
-///
-/// A manifest the commit in progress wrote is not in a manifest list yet and
-/// has no `first_row_id` of its own, so its entries are read with the
-/// `first_row_id` they state.
-async fn read_merge_input(
-    table: &Table,
-    snapshot_id: i64,
-    manifest_file: &ManifestFile,
-) -> Result<Manifest> {
-    if manifest_file.added_snapshot_id == snapshot_id {
-        table
-            .manifest_reader()
-            .read_uncommitted(manifest_file)
-            .await
-    } else {
-        table.manifest_reader().read(manifest_file).await
-    }
-}
-
-/// `entry`, read by [`read_merge_input`], as the merged manifest written by
+/// `entry`, read with everything it inherits resolved, as the merged manifest written by
 /// the snapshot `snapshot_id` carries it; `None` when it is not carried.
 ///
 /// - A file the snapshot adds stays `ADDED`. Its `first_row_id` is left to be
@@ -490,14 +475,14 @@ async fn read_merge_input(
 /// - Every other file is `EXISTING`, with the snapshot that added it, its
 ///   sequence numbers and its `first_row_id` stated, since the merged manifest
 ///   is listed under another snapshot, sequence number and `first_row_id`.
-fn to_merged_entry(entry: &ManifestEntry, snapshot_id: i64) -> Option<ManifestEntry> {
+fn to_merged_entry(entry: EncodedEntry, snapshot_id: i64) -> Option<EncodedEntry> {
     let is_of_this_snapshot = entry.snapshot_id() == Some(snapshot_id);
-    let mut merged_entry = entry.clone();
-    match entry.status() {
+    let mut merged_entry = entry;
+    match merged_entry.status() {
         ManifestStatus::Deleted if !is_of_this_snapshot => return None,
         ManifestStatus::Deleted => {}
         ManifestStatus::Added if is_of_this_snapshot => {
-            merged_entry.data_file.first_row_id = None;
+            merged_entry.first_row_id = None;
         }
         ManifestStatus::Added | ManifestStatus::Existing => {
             merged_entry.status = ManifestStatus::Existing;
@@ -527,13 +512,16 @@ fn parse_property<T: std::str::FromStr>(
 mod tests {
     use crate::Catalog;
     use crate::memory::tests::new_memory_catalog;
-    use crate::spec::{ManifestStatus, TableProperties};
+    use crate::spec::{
+        EncodedEntry, EncodedManifest, EntryCodec, ManifestEntry, ManifestStatus, TableProperties,
+    };
     use crate::table::Table;
     use crate::transaction::tests::{
         append_files, append_files_merging_manifests, collect_live_paths, find_entry_by_path,
         load_current_entries, load_current_manifests, make_data_file,
         make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog, set_table_properties,
     };
+    use crate::transaction::{ApplyTransactionAction, Transaction};
 
     const MIN_COUNT_TO_MERGE: &str = TableProperties::PROPERTY_COMMIT_MANIFEST_MIN_COUNT_TO_MERGE;
 
@@ -765,5 +753,91 @@ mod tests {
         assert_eq!(manifests.len(), 3);
         assert_eq!(manifests[..2], manifests_before);
         assert_eq!(manifests[2].added_files_count, Some(1));
+    }
+
+    /// The bytes a manifest holds each of `entries` as.
+    fn write_entries(codec: &EntryCodec, entries: &[EncodedEntry]) -> Vec<Vec<u8>> {
+        entries
+            .iter()
+            .map(|entry| {
+                let mut written = Vec::new();
+                codec.write_entry(entry, &mut written);
+                written
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_manifest_written_is_held_as_it_reads() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_file(&catalog, &table, "test/1.parquet", 10).await;
+        let manifest_file = load_current_manifests(&table).await.remove(0);
+
+        let held = EncodedManifest::find(&manifest_file.manifest_path).unwrap();
+        let codec = held.build_codec().unwrap();
+        let held_entries: Vec<ManifestEntry> = held
+            .read_entries(&manifest_file)
+            .unwrap()
+            .iter()
+            .map(|entry| codec.decode(entry).unwrap())
+            .collect();
+
+        let read = table.manifest_reader().read(&manifest_file).await.unwrap();
+        let read_entries: Vec<ManifestEntry> = read
+            .entries()
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect();
+        assert_eq!(held_entries, read_entries);
+    }
+
+    #[tokio::test]
+    async fn test_entries_of_a_manifest_not_held_are_encoded_from_its_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = append_file(&catalog, &table, "test/1.parquet", 10).await;
+        let manifest_file = load_current_manifests(&table).await.remove(0);
+        let codec = EntryCodec::of_table(&table, manifest_file.partition_spec_id).unwrap();
+        let held_entries = EncodedManifest::load_entries(&table, &manifest_file, &codec, false)
+            .await
+            .unwrap();
+        EncodedManifest::forget_under(table.metadata().location());
+
+        let loaded_entries = EncodedManifest::load_entries(&table, &manifest_file, &codec, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            write_entries(&codec, &loaded_entries),
+            write_entries(&codec, &held_entries)
+        );
+        assert!(EncodedManifest::find(&manifest_file.manifest_path).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_removes_a_file_of_a_manifest_not_held() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let files = vec![
+            make_data_file(&table, "test/1.parquet", 10, 100),
+            make_data_file(&table, "test/2.parquet", 20, 100),
+        ];
+        let table = append_files(&catalog, &table, files).await;
+        EncodedManifest::forget_under(table.metadata().location());
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file(make_data_file(&table, "test/1.parquet", 10, 100))
+            .add_file(make_data_file(&table, "test/3.parquet", 10, 100));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), vec![
+            "test/2.parquet",
+            "test/3.parquet"
+        ]);
     }
 }
