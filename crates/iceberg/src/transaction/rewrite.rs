@@ -42,6 +42,16 @@ pub struct PreparedRewrite {
     manifests: PreparedManifests,
 }
 
+impl PreparedRewrite {
+    /// The manifests, of the snapshot the rewrite was prepared on, that the
+    /// manifests written ahead take the place of. While a table lists every
+    /// one of them, it lists the files the rewrite removes where the rewrite
+    /// found them, and a commit can list the manifests written ahead.
+    pub fn replaced_manifest_paths(&self) -> impl Iterator<Item = &str> {
+        self.manifests.replaced_manifest_paths()
+    }
+}
+
 /// A transaction action that rewrites (replaces) data files.
 ///
 /// This is the Rust equivalent of Java's `BaseRewriteFiles`. It uses

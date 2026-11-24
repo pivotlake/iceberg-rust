@@ -408,6 +408,20 @@ fn may_hold_partition(
 }
 
 impl PreparedManifests {
+    /// The manifests of the base that the manifests written ahead take the
+    /// place of.
+    pub(crate) fn replaced_manifest_paths(&self) -> impl Iterator<Item = &str> {
+        let kept_manifest_paths: HashSet<&str> = self
+            .manifests
+            .iter()
+            .map(|manifest| manifest.manifest_path.as_str())
+            .collect();
+        self.base_manifest_paths
+            .iter()
+            .map(String::as_str)
+            .filter(move |path| !kept_manifest_paths.contains(path))
+    }
+
     /// The manifests the snapshot lists on top of `table`, or `None` when
     /// the manifests written ahead no longer stand on it.
     async fn list_on(&self, table: &Table) -> Result<Option<Vec<ManifestFile>>> {
@@ -427,16 +441,10 @@ impl PreparedManifests {
             .iter()
             .map(|manifest| manifest.manifest_path.as_str())
             .collect();
-        let kept_manifest_paths: HashSet<&str> = self
-            .manifests
-            .iter()
-            .map(|manifest| manifest.manifest_path.as_str())
-            .collect();
-        let is_replaced_manifest_gone = self.base_manifest_paths.iter().any(|path| {
-            !kept_manifest_paths.contains(path.as_str())
-                && !current_manifest_paths.contains(path.as_str())
-        });
-        if is_replaced_manifest_gone {
+        if self
+            .replaced_manifest_paths()
+            .any(|path| !current_manifest_paths.contains(path))
+        {
             return Ok(None);
         }
 
