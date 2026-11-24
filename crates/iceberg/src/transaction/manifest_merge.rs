@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::future::try_join_all;
 
@@ -269,8 +269,12 @@ impl ManifestMergeManager {
 
         let mut data_manifests: Vec<Option<SnapshotManifest>> =
             data_manifests.into_iter().map(Some).collect();
-        let mut merged_manifests = Vec::with_capacity(data_manifests.len());
-        for bin_positions in bins {
+        // The manifests of every bin are written at once: writing one is
+        // mostly waiting for the store to take it. Each takes the next
+        // generated path when it comes to be written.
+        let generate_manifest_path = Mutex::new(generate_manifest_path);
+        let generate_manifest_path = &generate_manifest_path;
+        let written_bins = try_join_all(bins.into_iter().map(|bin_positions| {
             let holds_first_manifest = bin_positions[0] == 0;
             let bin: Vec<SnapshotManifest> = bin_positions
                 .iter()
@@ -280,37 +284,42 @@ impl ManifestMergeManager {
                         .expect("a manifest is packed into one bin")
                 })
                 .collect();
-            let is_below_min_count = holds_first_manifest && bin.len() < self.min_count_to_merge;
-            let merged_manifest = if bin.len() == 1 || is_below_min_count {
-                None
-            } else {
-                self.merge_bin(
-                    table,
-                    snapshot_id,
-                    &bin,
-                    &mut generate_manifest_path,
-                    written_files,
-                )
-                .await?
-            };
-            match merged_manifest {
-                Some(merged_manifest) => merged_manifests.push(merged_manifest),
-                None => {
-                    for manifest in bin {
-                        merged_manifests.push(
+            async move {
+                let is_below_min_count =
+                    holds_first_manifest && bin.len() < self.min_count_to_merge;
+                let merged_manifest = if bin.len() == 1 || is_below_min_count {
+                    None
+                } else {
+                    self.merge_bin(
+                        table,
+                        snapshot_id,
+                        &bin,
+                        &mut || (generate_manifest_path.lock().unwrap())(),
+                        written_files,
+                    )
+                    .await?
+                };
+                match merged_manifest {
+                    Some(merged_manifest) => Ok::<Vec<ManifestFile>, Error>(vec![merged_manifest]),
+                    None => {
+                        try_join_all(bin.into_iter().map(|manifest| async move {
                             manifest
                                 .into_written(
                                     table,
                                     snapshot_id,
-                                    &mut generate_manifest_path,
+                                    &mut || (generate_manifest_path.lock().unwrap())(),
                                     written_files,
                                 )
-                                .await?,
-                        );
+                                .await
+                        }))
+                        .await
                     }
                 }
             }
-        }
+        }))
+        .await?;
+        let mut merged_manifests: Vec<ManifestFile> = written_bins.into_iter().flatten().collect();
+        let mut generate_manifest_path = || (generate_manifest_path.lock().unwrap())();
 
         for manifest in delete_manifests {
             merged_manifests.push(
