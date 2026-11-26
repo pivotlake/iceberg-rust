@@ -396,9 +396,11 @@ impl ManifestWriter {
     }
 
     fn add_entry_inner(&mut self, entry: ManifestEntry) -> Result<()> {
-        // Check if the entry has sequence number
+        // An entry that is not added cannot inherit its data sequence number,
+        // so it has to state it. Its file sequence number may be unknown: a
+        // file committed by a writer that did not record one has none.
         if (entry.status == ManifestStatus::Deleted || entry.status == ManifestStatus::Existing)
-            && (entry.sequence_number.is_none() || entry.file_sequence_number.is_none())
+            && entry.sequence_number.is_none()
         {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
