@@ -27,6 +27,7 @@ use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, MergeManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
+use crate::transaction::written_files::WrittenFiles;
 use crate::transaction::{ActionCommit, TransactionAction};
 
 /// FastAppendAction is a transaction action for fast append data files to the table.
@@ -110,11 +111,21 @@ impl FastAppendAction {
 #[async_trait]
 impl TransactionAction for FastAppendAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        self.commit_recording_files(table, &WrittenFiles::default())
+            .await
+    }
+
+    async fn commit_recording_files(
+        self: Arc<Self>,
+        table: &Table,
+        written_files: &WrittenFiles,
+    ) -> Result<ActionCommit> {
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.snapshot_properties.clone(),
             self.dedupe_added_files(),
+            written_files,
         );
 
         // validate added files
