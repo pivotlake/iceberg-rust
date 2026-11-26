@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::encryption::EncryptionManager;
 use crate::io::FileIO;
 use crate::spec::{
-    FormatVersion, Manifest, ManifestFile, ManifestList, ManifestListReader, ManifestReader,
-    SchemaId, SnapshotRef, TableMetadataRef,
+    FieldSummary, FormatVersion, Manifest, ManifestEntry, ManifestFile, ManifestList,
+    ManifestListReader, ManifestReader, PrimitiveLiteral, SchemaId, SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -51,6 +51,10 @@ pub(crate) enum CachedObjectKey {
 /// tables whose file IO carry different credentials included. A table builds
 /// a cache of its own unless given one to share
 /// ([`TableBuilder::object_cache`](crate::table::TableBuilder::object_cache)).
+///
+/// The capacity is in bytes of parsed objects: an object weighs what its
+/// parsed form holds, estimated from its entries, their paths, partition
+/// values, bounds and counts.
 #[derive(Clone, Debug)]
 pub struct ObjectCache {
     cache: moka::future::Cache<CachedObjectKey, CachedItem>,
@@ -78,10 +82,7 @@ impl ObjectCache {
         } else {
             Self {
                 cache: moka::future::Cache::builder()
-                    .weigher(|_, val: &CachedItem| match val {
-                        CachedItem::ManifestList(item) => size_of_val(item.as_ref()),
-                        CachedItem::Manifest(item) => size_of_val(item.as_ref()),
-                    } as u32)
+                    .weigher(|_, val: &CachedItem| weigh(val))
                     .max_capacity(cache_size_bytes)
                     .build(),
                 cache_disabled: false,
@@ -224,6 +225,91 @@ impl ObjectCache {
         .await?;
 
         Ok(CachedItem::ManifestList(Arc::new(manifest_list)))
+    }
+}
+
+/// What a map entry costs beyond its key and value: the table's control
+/// bytes and the slack of its load factor, taken as the entry over again.
+const MAP_ENTRY_SLACK_FACTOR: usize = 2;
+
+/// The weight of a cached object: the bytes its parsed form holds, estimated,
+/// saturated at the weigher's range.
+fn weigh(item: &CachedItem) -> u32 {
+    let bytes = match item {
+        CachedItem::ManifestList(list) => estimate_manifest_list_size(list),
+        CachedItem::Manifest(manifest) => estimate_manifest_size(manifest),
+    };
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
+
+fn estimate_manifest_list_size(list: &ManifestList) -> usize {
+    size_of::<ManifestList>()
+        + list
+            .entries()
+            .iter()
+            .map(estimate_manifest_file_size)
+            .sum::<usize>()
+}
+
+fn estimate_manifest_file_size(file: &ManifestFile) -> usize {
+    let summaries = file.partitions.as_deref().unwrap_or_default();
+    size_of::<ManifestFile>()
+        + file.manifest_path.len()
+        + summaries
+            .iter()
+            .map(|summary| {
+                size_of::<FieldSummary>()
+                    + summary.lower_bound.as_ref().map_or(0, |bound| bound.len())
+                    + summary.upper_bound.as_ref().map_or(0, |bound| bound.len())
+            })
+            .sum::<usize>()
+        + file.key_metadata.as_ref().map_or(0, Vec::len)
+}
+
+fn estimate_manifest_size(manifest: &Manifest) -> usize {
+    size_of::<Manifest>()
+        + manifest
+            .entries()
+            .iter()
+            .map(|entry| estimate_manifest_entry_size(entry))
+            .sum::<usize>()
+}
+
+fn estimate_manifest_entry_size(entry: &ManifestEntry) -> usize {
+    let data_file = entry.data_file();
+    let counts = data_file.column_sizes().len()
+        + data_file.value_counts().len()
+        + data_file.null_value_counts().len()
+        + data_file.nan_value_counts().len();
+    let bounds = data_file
+        .lower_bounds()
+        .values()
+        .chain(data_file.upper_bounds().values())
+        .map(|bound| {
+            size_of::<(i32, crate::spec::Datum)>() * MAP_ENTRY_SLACK_FACTOR
+                + estimate_literal_heap_size(bound.literal())
+        })
+        .sum::<usize>();
+    size_of::<ManifestEntry>()
+        + data_file.file_path().len()
+        + size_of_val(data_file.partition().fields())
+        + counts * size_of::<(i32, u64)>() * MAP_ENTRY_SLACK_FACTOR
+        + bounds
+        + data_file.key_metadata().map_or(0, <[u8]>::len)
+        + data_file.split_offsets().map_or(0, size_of_val)
+        + data_file
+            .equality_ids()
+            .map_or(0, |ids| ids.len() * size_of::<i32>())
+        + data_file
+            .referenced_data_file()
+            .map_or(0, |path| path.len())
+}
+
+fn estimate_literal_heap_size(literal: &PrimitiveLiteral) -> usize {
+    match literal {
+        PrimitiveLiteral::String(string) => string.len(),
+        PrimitiveLiteral::Binary(bytes) => bytes.len(),
+        _ => 0,
     }
 }
 
@@ -495,6 +581,33 @@ mod tests {
             .unwrap();
 
         assert!(Arc::ptr_eq(&loaded_by_first, &served_to_second));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_weighs_its_entries() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let object_cache = ObjectCache::new();
+        let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+        let manifest_list = object_cache
+            .get_manifest_list(
+                snapshot,
+                &fixture.table.metadata_ref(),
+                fixture.table.file_io(),
+                None,
+            )
+            .await
+            .unwrap();
+        let manifest = object_cache
+            .get_manifest(&manifest_list.entries()[0], fixture.table.file_io())
+            .await
+            .unwrap();
+
+        let weight = weigh(&CachedItem::Manifest(manifest.clone()));
+
+        let entry = manifest.entries()[0].data_file();
+        let at_least = size_of::<Manifest>() + size_of::<ManifestEntry>() + entry.file_path().len();
+        assert!(weight as usize >= at_least, "{weight} < {at_least}");
     }
 
     #[tokio::test]
