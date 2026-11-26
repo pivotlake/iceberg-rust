@@ -2086,7 +2086,12 @@ pub(crate) mod tests {
         let snapshot_ref = table.metadata().current_snapshot().unwrap();
         let manifest_list = table
             .object_cache()
-            .get_manifest_list(snapshot_ref, &table.metadata_ref())
+            .get_manifest_list(
+                snapshot_ref,
+                &table.metadata_ref(),
+                table.file_io(),
+                table.encryption_manager().cloned(),
+            )
             .await
             .unwrap();
         assert_eq!(manifest_list.entries().len(), 0);

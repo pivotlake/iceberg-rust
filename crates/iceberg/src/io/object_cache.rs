@@ -44,31 +44,37 @@ pub(crate) enum CachedObjectKey {
     Manifest((String, Option<u64>)),
 }
 
-/// Caches metadata objects deserialized from immutable files
+/// Caches metadata objects deserialized from immutable files.
+///
+/// A cache holds no file IO of its own: a lookup reads a miss through the
+/// [`FileIO`] it is given, so one cache can serve every table of a process,
+/// tables whose file IO carry different credentials included. A table builds
+/// a cache of its own unless given one to share
+/// ([`TableBuilder::object_cache`](crate::table::TableBuilder::object_cache)).
 #[derive(Clone, Debug)]
 pub struct ObjectCache {
     cache: moka::future::Cache<CachedObjectKey, CachedItem>,
-    file_io: FileIO,
     cache_disabled: bool,
-    encryption_manager: Option<Arc<EncryptionManager>>,
+}
+
+impl Default for ObjectCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ObjectCache {
     /// Creates a new [`ObjectCache`]
     /// with the default cache size
-    pub(crate) fn new(file_io: FileIO, encryption_manager: Option<Arc<EncryptionManager>>) -> Self {
-        Self::new_with_capacity(file_io, DEFAULT_CACHE_SIZE_BYTES, encryption_manager)
+    pub fn new() -> Self {
+        Self::new_with_capacity(DEFAULT_CACHE_SIZE_BYTES)
     }
 
-    /// Creates a new [`ObjectCache`]
-    /// with a specific cache size
-    pub(crate) fn new_with_capacity(
-        file_io: FileIO,
-        cache_size_bytes: u64,
-        encryption_manager: Option<Arc<EncryptionManager>>,
-    ) -> Self {
+    /// Creates a new [`ObjectCache`] holding at most `cache_size_bytes` of
+    /// parsed objects. A capacity of zero disables caching.
+    pub fn new_with_capacity(cache_size_bytes: u64) -> Self {
         if cache_size_bytes == 0 {
-            Self::with_disabled_cache(file_io, encryption_manager)
+            Self::with_disabled_cache()
         } else {
             Self {
                 cache: moka::future::Cache::builder()
@@ -78,32 +84,29 @@ impl ObjectCache {
                     } as u32)
                     .max_capacity(cache_size_bytes)
                     .build(),
-                file_io,
                 cache_disabled: false,
-                encryption_manager,
             }
         }
     }
 
     /// Creates a new [`ObjectCache`]
     /// with caching disabled
-    pub(crate) fn with_disabled_cache(
-        file_io: FileIO,
-        encryption_manager: Option<Arc<EncryptionManager>>,
-    ) -> Self {
+    pub fn with_disabled_cache() -> Self {
         Self {
             cache: moka::future::Cache::new(0),
-            file_io,
             cache_disabled: true,
-            encryption_manager,
         }
     }
 
-    /// Retrieves an Arc [`Manifest`] from the cache
-    /// or retrieves one from FileIO and parses it if not present
-    pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
+    /// Retrieves an Arc [`Manifest`] from the cache, or reads it through
+    /// `file_io` and parses it if not present
+    pub async fn get_manifest(
+        &self,
+        manifest_file: &ManifestFile,
+        file_io: &FileIO,
+    ) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
-            return ManifestReader::new(self.file_io.clone())
+            return ManifestReader::new(file_io.clone())
                 .read(manifest_file)
                 .await
                 .map(Arc::new);
@@ -117,7 +120,7 @@ impl ObjectCache {
         let cache_entry = self
             .cache
             .entry_by_ref(&key)
-            .or_try_insert_with(self.fetch_and_parse_manifest(manifest_file))
+            .or_try_insert_with(Self::fetch_and_parse_manifest(manifest_file, file_io))
             .await
             .map_err(|err| {
                 Error::new(
@@ -137,19 +140,22 @@ impl ObjectCache {
         }
     }
 
-    /// Retrieves an Arc [`ManifestList`] from the cache
-    /// or retrieves one from FileIO and parses it if not present
-    pub(crate) async fn get_manifest_list(
+    /// Retrieves an Arc [`ManifestList`] from the cache, or reads it through
+    /// `file_io` and parses it if not present, decrypting it with
+    /// `encryption_manager` when the table is encrypted
+    pub async fn get_manifest_list(
         &self,
         snapshot: &SnapshotRef,
         table_metadata: &TableMetadataRef,
+        file_io: &FileIO,
+        encryption_manager: Option<Arc<EncryptionManager>>,
     ) -> Result<Arc<ManifestList>> {
         if self.cache_disabled {
             return ManifestListReader::new(
                 snapshot.clone(),
-                self.file_io.clone(),
+                file_io.clone(),
                 table_metadata.clone(),
-                self.encryption_manager.clone(),
+                encryption_manager,
             )
             .load()
             .await
@@ -164,7 +170,12 @@ impl ObjectCache {
         let cache_entry = self
             .cache
             .entry_by_ref(&key)
-            .or_try_insert_with(self.fetch_and_parse_manifest_list(snapshot, table_metadata))
+            .or_try_insert_with(Self::fetch_and_parse_manifest_list(
+                snapshot,
+                table_metadata,
+                file_io,
+                encryption_manager,
+            ))
             .await
             .map_err(|err| {
                 Arc::try_unwrap(err).unwrap_or_else(|err| {
@@ -186,8 +197,11 @@ impl ObjectCache {
         }
     }
 
-    async fn fetch_and_parse_manifest(&self, manifest_file: &ManifestFile) -> Result<CachedItem> {
-        let manifest = ManifestReader::new(self.file_io.clone())
+    async fn fetch_and_parse_manifest(
+        manifest_file: &ManifestFile,
+        file_io: &FileIO,
+    ) -> Result<CachedItem> {
+        let manifest = ManifestReader::new(file_io.clone())
             .read(manifest_file)
             .await?;
 
@@ -195,15 +209,16 @@ impl ObjectCache {
     }
 
     async fn fetch_and_parse_manifest_list(
-        &self,
         snapshot: &SnapshotRef,
         table_metadata: &TableMetadataRef,
+        file_io: &FileIO,
+        encryption_manager: Option<Arc<EncryptionManager>>,
     ) -> Result<CachedItem> {
         let manifest_list = ManifestListReader::new(
             snapshot.clone(),
-            self.file_io.clone(),
+            file_io.clone(),
             table_metadata.clone(),
-            self.encryption_manager.clone(),
+            encryption_manager,
         )
         .load()
         .await?;
@@ -354,12 +369,14 @@ mod tests {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;
 
-        let object_cache = ObjectCache::with_disabled_cache(fixture.table.file_io().clone(), None);
+        let object_cache = ObjectCache::with_disabled_cache();
 
         let result_manifest_list = object_cache
             .get_manifest_list(
                 fixture.table.metadata().current_snapshot().unwrap(),
                 &fixture.table.metadata_ref(),
+                fixture.table.file_io(),
+                None,
             )
             .await
             .unwrap();
@@ -367,7 +384,10 @@ mod tests {
         assert_eq!(result_manifest_list.entries().len(), 1);
 
         let manifest_file = result_manifest_list.entries().first().unwrap();
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, fixture.table.file_io())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -387,13 +407,15 @@ mod tests {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;
 
-        let object_cache = ObjectCache::new(fixture.table.file_io().clone(), None);
+        let object_cache = ObjectCache::new();
 
         // not in cache
         let result_manifest_list = object_cache
             .get_manifest_list(
                 fixture.table.metadata().current_snapshot().unwrap(),
                 &fixture.table.metadata_ref(),
+                fixture.table.file_io(),
+                None,
             )
             .await
             .unwrap();
@@ -405,6 +427,8 @@ mod tests {
             .get_manifest_list(
                 fixture.table.metadata().current_snapshot().unwrap(),
                 &fixture.table.metadata_ref(),
+                fixture.table.file_io(),
+                None,
             )
             .await
             .unwrap();
@@ -414,7 +438,10 @@ mod tests {
         let manifest_file = result_manifest_list.entries().first().unwrap();
 
         // not in cache
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, fixture.table.file_io())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -429,7 +456,10 @@ mod tests {
         );
 
         // retrieve cached version
-        let result_manifest = object_cache.get_manifest(manifest_file).await.unwrap();
+        let result_manifest = object_cache
+            .get_manifest(manifest_file, fixture.table.file_io())
+            .await
+            .unwrap();
 
         assert_eq!(
             result_manifest
@@ -442,6 +472,29 @@ mod tests {
                 .unwrap(),
             "1.parquet"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cache_shared_between_tables_serves_one_tables_load_to_another() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let shared = Arc::new(ObjectCache::new());
+        let first = fixture.table.clone().with_object_cache(shared.clone());
+        let second = fixture.table.clone().with_object_cache(shared.clone());
+        let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+
+        let loaded_by_first = first
+            .object_cache()
+            .get_manifest_list(snapshot, &first.metadata_ref(), first.file_io(), None)
+            .await
+            .unwrap();
+        let served_to_second = second
+            .object_cache()
+            .get_manifest_list(snapshot, &second.metadata_ref(), second.file_io(), None)
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&loaded_by_first, &served_to_second));
     }
 
     #[tokio::test]
@@ -496,10 +549,16 @@ mod tests {
         let mut manifest_file_b = manifest_file;
         manifest_file_b.first_row_id = Some(2000);
 
-        let object_cache = ObjectCache::new(io, None);
+        let object_cache = ObjectCache::new();
 
-        let manifest_a = object_cache.get_manifest(&manifest_file_a).await.unwrap();
-        let manifest_b = object_cache.get_manifest(&manifest_file_b).await.unwrap();
+        let manifest_a = object_cache
+            .get_manifest(&manifest_file_a, &io)
+            .await
+            .unwrap();
+        let manifest_b = object_cache
+            .get_manifest(&manifest_file_b, &io)
+            .await
+            .unwrap();
 
         // A cache keyed on path alone would serve manifest_a's inherited ids for
         // the second read; keying on first_row_id keeps them distinct.
