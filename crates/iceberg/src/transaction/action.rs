@@ -23,6 +23,7 @@ use async_trait::async_trait;
 
 use crate::table::Table;
 use crate::transaction::Transaction;
+use crate::transaction::written_files::WrittenFiles;
 use crate::{Result, TableRequirement, TableUpdate};
 
 /// A boxed, thread-safe reference to a `TransactionAction`.
@@ -47,6 +48,24 @@ pub(crate) trait TransactionAction: AsAny + Sync + Send {
     /// An `ActionCommit` containing table updates and table requirements,
     /// or an error if the commit fails.
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit>;
+
+    /// Commits this action as part of one attempt of [`Transaction::commit`],
+    /// which deletes the files recorded in `written_files` that nothing
+    /// references once the attempt has ended: all of them when it did not
+    /// commit, the manifests no manifest list names when it did.
+    ///
+    /// An action that writes manifests or a manifest list overrides this and
+    /// creates each manifest through [`WrittenFiles::new_manifest_output`]
+    /// and each manifest list through
+    /// [`WrittenFiles::new_manifest_list_output`]; an action that only changes
+    /// table metadata keeps this implementation.
+    async fn commit_recording_files(
+        self: Arc<Self>,
+        table: &Table,
+        _written_files: &WrittenFiles,
+    ) -> Result<ActionCommit> {
+        self.commit(table).await
+    }
 }
 
 /// A helper trait for applying a `TransactionAction` to a `Transaction`.

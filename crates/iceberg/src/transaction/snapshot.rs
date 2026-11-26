@@ -32,6 +32,8 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
+use crate::transaction::manifest_merge::ManifestMergeManager;
+use crate::transaction::written_files::WrittenFiles;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// A trait that defines how different table operations produce new snapshots.
@@ -87,24 +89,59 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
+/// A [`ManifestProcess`] that lists the manifests as they are.
 pub(crate) struct DefaultManifestProcess;
 
 impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifests(
+    async fn process_manifests(
         &self,
-        _snapshot_produce: &SnapshotProducer<'_>,
+        _snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile> {
-        manifests
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(manifests)
     }
 }
 
+/// A [`ManifestProcess`] that merges small data manifests, see
+/// [`ManifestMergeManager`].
+pub(crate) struct MergeManifestProcess;
+
+impl ManifestProcess for MergeManifestProcess {
+    async fn process_manifests(
+        &self,
+        snapshot_produce: &mut SnapshotProducer<'_>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let table = snapshot_produce.table;
+        let snapshot_id = snapshot_produce.snapshot_id;
+        let written_files = snapshot_produce.written_files;
+        let (new_manifests, carried_manifests) = manifests
+            .into_iter()
+            .partition(|manifest| manifest.added_snapshot_id == snapshot_id);
+        ManifestMergeManager::try_from_table(table)?
+            .merge_manifests(
+                table,
+                snapshot_id,
+                new_manifests,
+                carried_manifests,
+                || snapshot_produce.generate_manifest_file_path(),
+                written_files,
+            )
+            .await
+    }
+}
+
+/// Decides which manifests the new snapshot lists, given the manifests the
+/// operation carried forward and wrote: the last step before the manifest
+/// list is written.
 pub(crate) trait ManifestProcess: Send + Sync {
+    /// Returns the manifests the new snapshot lists. May read `manifests` and
+    /// write new ones, named by `snapshot_produce`.
     fn process_manifests(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile>;
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
 pub(crate) struct SnapshotProducer<'a> {
@@ -117,6 +154,8 @@ pub(crate) struct SnapshotProducer<'a> {
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
     manifest_counter: RangeFrom<u64>,
+    /// Records the manifests and the manifest list this producer writes.
+    written_files: &'a WrittenFiles,
 }
 
 impl<'a> SnapshotProducer<'a> {
@@ -125,6 +164,7 @@ impl<'a> SnapshotProducer<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        written_files: &'a WrittenFiles,
     ) -> Self {
         Self {
             table,
@@ -133,6 +173,7 @@ impl<'a> SnapshotProducer<'a> {
             snapshot_properties,
             added_data_files,
             manifest_counter: (0..),
+            written_files,
         }
     }
 
@@ -238,15 +279,22 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_id
     }
 
-    fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
-        let new_manifest_path = format!(
+    /// The path of the next manifest this producer writes.
+    fn generate_manifest_file_path(&mut self) -> Result<String> {
+        Ok(format!(
             "{}/{}-m{}.{}",
             self.table.metadata().metadata_location()?,
             self.commit_uuid,
             self.manifest_counter.next().unwrap(),
             DataFileFormat::Avro
-        );
-        let output_file = self.table.file_io().new_output(new_manifest_path)?;
+        ))
+    }
+
+    fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
+        let new_manifest_path = self.generate_manifest_file_path()?;
+        let output_file = self
+            .written_files
+            .new_manifest_output(self.table.file_io(), new_manifest_path)?;
         let partition_spec = self
             .table
             .metadata()
@@ -372,8 +420,9 @@ impl<'a> SnapshotProducer<'a> {
         // # TODO
         // Support process delete entries.
 
-        let manifest_files = manifest_process.process_manifests(self, manifest_files);
-        Ok(manifest_files)
+        manifest_process
+            .process_manifests(self, manifest_files)
+            .await
     }
 
     // Returns a `Summary` of the current snapshot
@@ -487,10 +536,11 @@ impl<'a> SnapshotProducer<'a> {
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
 
-        let raw_output = self
-            .table
-            .file_io()
-            .new_output(manifest_list_path.clone())?;
+        let raw_output = self.written_files.new_manifest_list_output(
+            self.table.file_io(),
+            manifest_list_path.clone(),
+            &manifests,
+        )?;
 
         let (writer, encryption_key_id) = match self.table.encryption_manager() {
             Some(em) => {
@@ -524,7 +574,14 @@ impl<'a> SnapshotProducer<'a> {
         let writer_next_row_id = manifest_list_writer.next_row_id();
         manifest_list_writer.close().await?;
 
-        let commit_ts = chrono::Utc::now().timestamp_millis();
+        // A snapshot is dated after its parent even when the clock is behind
+        // the one that dated the parent.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let commit_ts = self
+            .table
+            .metadata()
+            .current_snapshot()
+            .map_or(now_ms, |parent| now_ms.max(parent.timestamp_ms() + 1));
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
@@ -559,16 +616,24 @@ impl<'a> SnapshotProducer<'a> {
             })
             .unwrap_or_default();
 
+        // Moving the branch keeps the retention it was given; only a branch
+        // this commit creates starts without one.
+        let main_branch_retention = self
+            .table
+            .metadata()
+            .refs()
+            .get(MAIN_BRANCH)
+            .map_or(SnapshotRetention::branch(None, None, None), |reference| {
+                reference.retention.clone()
+            });
+
         let updates = [encryption_key_updates, vec![
             TableUpdate::AddSnapshot {
                 snapshot: new_snapshot,
             },
             TableUpdate::SetSnapshotRef {
                 ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(
-                    self.snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
+                reference: SnapshotReference::new(self.snapshot_id, main_branch_retention),
             },
         ]]
         .concat();

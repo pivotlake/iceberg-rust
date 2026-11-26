@@ -404,6 +404,28 @@ impl TableProperties<'_> {
         Self::PROPERTY_DEFAULT_SORT_ORDER,
     ];
 
+    /// Property key for whether a commit that asks for manifest merging
+    /// merges manifests.
+    pub const PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED: &'static str =
+        "commit.manifest-merge.enabled";
+    /// Default value for whether a commit that asks for manifest merging
+    /// merges manifests.
+    pub const PROPERTY_COMMIT_MANIFEST_MERGE_ENABLED_DEFAULT: bool = true;
+
+    /// Property key for the size (bytes) data manifests are merged up to.
+    pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES: &'static str =
+        "commit.manifest.target-size-bytes";
+    /// Default value for the size (bytes) data manifests are merged up to.
+    pub const PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u64 = 8 * 1024 * 1024; // 8 MB
+
+    /// Property key for the number of manifests that have to accumulate
+    /// before they are merged with the one a commit writes.
+    pub const PROPERTY_COMMIT_MANIFEST_MIN_COUNT_TO_MERGE: &'static str =
+        "commit.manifest.min-count-to-merge";
+    /// Default value for the number of manifests that have to accumulate
+    /// before they are merged with the one a commit writes.
+    pub const PROPERTY_COMMIT_MANIFEST_MIN_COUNT_TO_MERGE_DEFAULT: usize = 100;
+
     /// Property key for number of commit retries.
     pub const PROPERTY_COMMIT_NUM_RETRIES: &'static str = "commit.retry.num-retries";
     /// Default value for number of commit retries.

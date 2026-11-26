@@ -55,6 +55,9 @@ pub struct TableMetadataBuilder {
     // None if this is a new table (from_metadata) method not used
     previous_history_entry: Option<MetadataLog>,
     last_updated_ms: Option<i64>,
+    // The metadata files whose log entries are dropped on build in place of the cap by count.
+    // None caps the log by count.
+    metadata_files_to_forget: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +132,7 @@ impl TableMetadataBuilder {
             last_added_spec_id: None,
             last_added_order_id: None,
             previous_history_entry: None,
+            metadata_files_to_forget: None,
         };
 
         builder
@@ -160,6 +164,7 @@ impl TableMetadataBuilder {
             last_added_spec_id: None,
             last_added_order_id: None,
             last_updated_ms: None,
+            metadata_files_to_forget: None,
         }
     }
 
@@ -1129,6 +1134,27 @@ impl TableMetadataBuilder {
         self
     }
 
+    /// Keep every entry of the metadata log on build except the ones naming `metadata_files`,
+    /// in place of capping the log at `write.metadata.previous-versions-max` entries.
+    ///
+    /// For a catalog that decides by a rule of its own, such as their age, which previous
+    /// metadata files a table forgets. The entries dropped are handed back as
+    /// [`TableMetadataBuildResult::expired_metadata_logs`]. Files accumulate across calls, and
+    /// no files at all keeps the whole log.
+    ///
+    /// The log's entries must stay in the order they were written, at most a minute apart
+    /// backwards, so drop them from the oldest on: an entry dropped from between two others
+    /// leaves those two as neighbours.
+    pub fn retain_metadata_log_except(
+        mut self,
+        metadata_files: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.metadata_files_to_forget
+            .get_or_insert_default()
+            .extend(metadata_files);
+        self
+    }
+
     /// Build the table metadata.
     pub fn build(mut self) -> Result<TableMetadataBuildResult> {
         self.metadata.last_updated_ms = self
@@ -1168,6 +1194,14 @@ impl TableMetadataBuilder {
     }
 
     fn expire_metadata_log(&mut self) -> Vec<MetadataLog> {
+        if let Some(metadata_files_to_forget) = self.metadata_files_to_forget.take() {
+            let (expired, retained) = std::mem::take(&mut self.metadata.metadata_log)
+                .into_iter()
+                .partition(|entry| metadata_files_to_forget.contains(&entry.metadata_file));
+            self.metadata.metadata_log = retained;
+            return expired;
+        }
+
         let max_size = self
             .metadata
             .properties
@@ -2537,6 +2571,72 @@ mod tests {
             .unwrap();
         assert_eq!(metadata.metadata.metadata_log.len(), 2);
         assert_eq!(metadata.expired_metadata_logs.len(), 1);
+    }
+
+    /// The metadata after one more commit on top of `metadata` for each of `commits`, the
+    /// commit `n` replacing the metadata file `path{n}` and dropping no log entry.
+    fn commit_keeping_metadata_log(
+        mut metadata: TableMetadata,
+        commits: std::ops::Range<usize>,
+    ) -> TableMetadata {
+        for commit in commits {
+            metadata = metadata
+                .into_builder(Some(format!("path{commit}")))
+                .retain_metadata_log_except([])
+                .build()
+                .unwrap()
+                .metadata;
+        }
+        metadata
+    }
+
+    fn metadata_files(log: &[MetadataLog]) -> Vec<&str> {
+        log.iter()
+            .map(|entry| entry.metadata_file.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_retain_metadata_log_except_nothing_ignores_the_cap() {
+        let capped = builder_without_changes(FormatVersion::V2)
+            .set_properties(HashMap::from_iter(vec![(
+                TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX.to_string(),
+                "2".to_string(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        let metadata = commit_keeping_metadata_log(capped, 2..6);
+
+        assert_eq!(metadata.metadata_log.len(), 5);
+    }
+
+    #[test]
+    fn test_retain_metadata_log_except_drops_the_named_files() {
+        let first_file = "s3://bucket/test/location/metadata/metadata1.json";
+        let metadata = commit_keeping_metadata_log(
+            builder_without_changes(FormatVersion::V2)
+                .build()
+                .unwrap()
+                .metadata,
+            2..5,
+        );
+
+        let result = metadata
+            .into_builder(Some("path5".to_string()))
+            .retain_metadata_log_except([first_file.to_string()])
+            .retain_metadata_log_except(["path2".to_string(), "unknown".to_string()])
+            .build()
+            .unwrap();
+
+        assert_eq!(metadata_files(&result.expired_metadata_logs), vec![
+            first_file, "path2"
+        ]);
+        assert_eq!(metadata_files(&result.metadata.metadata_log), vec![
+            "path3", "path4", "path5"
+        ]);
     }
 
     #[test]

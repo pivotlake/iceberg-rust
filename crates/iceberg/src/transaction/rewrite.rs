@@ -32,6 +32,7 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestContentType, Operation};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
+use crate::transaction::written_files::WrittenFiles;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
 
@@ -90,7 +91,27 @@ impl RewriteFilesAction {
     /// The file must exist in the current snapshot; otherwise the commit
     /// will fail with a validation error.
     pub fn delete_file(mut self, file: DataFile) -> Self {
-        self.producer.delete_data_file(file);
+        self.producer.delete_data_file(file, None);
+        self
+    }
+
+    /// Register a data file to be removed from the table, naming the
+    /// manifest that lists it: `manifest_path` is the path of that manifest
+    /// as the manifest list of the snapshot the rewrite was planned against
+    /// records it.
+    ///
+    /// The commit then reads that manifest for the file's entry before any
+    /// other, and no other when every file to remove was found where it was
+    /// said to be. A file the named manifest does not list, or whose named
+    /// manifest the snapshot committed on no longer lists, is looked for as
+    /// [`delete_file`](Self::delete_file) looks for it.
+    pub fn delete_file_listed_in(
+        mut self,
+        file: DataFile,
+        manifest_path: impl Into<String>,
+    ) -> Self {
+        self.producer
+            .delete_data_file(file, Some(manifest_path.into()));
         self
     }
 
@@ -111,6 +132,32 @@ impl RewriteFilesAction {
     /// a V1 table.
     pub fn data_sequence_number(mut self, sequence_number: i64) -> Self {
         self.producer.set_data_sequence_number(sequence_number);
+        self
+    }
+
+    /// Set whether to check that no added file is already referenced by the
+    /// table, which reads every data manifest. On by default.
+    pub fn with_check_duplicate(mut self, v: bool) -> Self {
+        self.producer.set_check_duplicate(v);
+        self
+    }
+
+    /// Set whether to merge small data manifests while committing. Off by
+    /// default: the rewrite then lists the manifests it did not touch as they
+    /// are.
+    ///
+    /// When on, and unless the table property `commit.manifest-merge.enabled`
+    /// is `false`, the snapshot lists the manifest of the added files first,
+    /// then the data manifests it keeps, then the delete manifests. The data
+    /// manifests of each partition spec are bin-packed by length, starting
+    /// from the last one, up to `commit.manifest.target-size-bytes` (8 MB by
+    /// default), and every bin of several manifests is rewritten as one; the
+    /// bin holding the first manifest is only rewritten once it has
+    /// `commit.manifest.min-count-to-merge` manifests (100 by default). A
+    /// rewritten manifest carries its files as existing entries with the
+    /// snapshot id, sequence numbers and `first_row_id` they had.
+    pub fn with_manifest_merge(mut self, v: bool) -> Self {
+        self.producer.set_manifest_merge(v);
         self
     }
 
@@ -185,9 +232,18 @@ impl RewriteFilesAction {
 #[async_trait]
 impl TransactionAction for RewriteFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        self.commit_recording_files(table, &WrittenFiles::default())
+            .await
+    }
+
+    async fn commit_recording_files(
+        self: Arc<Self>,
+        table: &Table,
+        written_files: &WrittenFiles,
+    ) -> Result<ActionCommit> {
         self.validate()?;
         self.validate_no_new_deletes(table).await?;
-        self.producer.commit_snapshot(table).await
+        self.producer.commit_snapshot(table, written_files).await
     }
 }
 
@@ -202,14 +258,17 @@ mod tests {
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
-        ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder,
-        NestedField, Operation, PrimitiveType, Schema, SnapshotRef, Struct, Transform, Type,
-        UnboundPartitionSpec,
+        MAIN_BRANCH, ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, Snapshot,
+        SnapshotRef, SnapshotReference, SnapshotRetention, Struct, TableProperties, Transform,
+        Type, UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::transaction::tests::{
-        append_files, make_data_file, make_v1_minimal_table_in_catalog,
-        make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog,
+        append_files, append_files_merging_manifests, collect_live_paths, find_entry_by_path,
+        load_current_entries, load_current_manifests, make_data_file,
+        make_v1_minimal_table_in_catalog, make_v2_minimal_table_in_catalog,
+        make_v3_minimal_table_in_catalog, set_table_properties,
     };
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, ErrorKind, NamespaceIdent, TableCommit, TableCreation, TableUpdate};
@@ -1345,5 +1404,534 @@ mod tests {
             vec!["ts=2026-08-24+09%3A30%3A00+UTC", "ts_day=2026-08-24"],
             "{summary:?}"
         );
+    }
+
+    const MIN_COUNT_TO_MERGE: &str = TableProperties::PROPERTY_COMMIT_MANIFEST_MIN_COUNT_TO_MERGE;
+
+    #[tokio::test]
+    async fn test_rewrite_files_merges_manifests_on_v1_table() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v1_minimal_table_in_catalog(&catalog).await;
+        rewrite_files_merging_manifests(&catalog, table).await;
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_merges_manifests_on_v2_table() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        rewrite_files_merging_manifests(&catalog, table).await;
+    }
+
+    async fn rewrite_files_merging_manifests(catalog: &impl Catalog, table: Table) {
+        let table = set_table_properties(catalog, &table, &[(MIN_COUNT_TO_MERGE, "3")]).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let f4 = make_data_file(&table, "test/4.parquet", 10, 100);
+        let table = append_files(catalog, &table, vec![f1.clone(), f2]).await;
+        let table = append_files(catalog, &table, vec![f3]).await;
+        let entries_before = load_current_entries(&table).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_manifest_merge(true)
+            .delete_file(f1)
+            .add_file(f4);
+        let table = action.apply(tx).unwrap().commit(catalog).await.unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifests = load_current_manifests(&table).await;
+        let entries = load_current_entries(&table).await;
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(collect_live_paths(&entries), [
+            "test/2.parquet",
+            "test/3.parquet",
+            "test/4.parquet"
+        ]);
+        let removed = find_entry_by_path(&entries, "test/1.parquet");
+        assert_eq!(removed.status(), ManifestStatus::Deleted);
+        assert_eq!(removed.snapshot_id(), Some(snapshot.snapshot_id()));
+        for path in ["test/2.parquet", "test/3.parquet"] {
+            let carried = find_entry_by_path(&entries, path);
+            let original = find_entry_by_path(&entries_before, path);
+            assert_eq!(carried.status(), ManifestStatus::Existing);
+            assert_eq!(carried.snapshot_id(), original.snapshot_id());
+            assert_eq!(carried.sequence_number(), original.sequence_number());
+        }
+    }
+
+    /// A rewrite that filters a manifest and merges it in the same commit
+    /// keeps the rows of the files it carries where they were.
+    #[tokio::test]
+    async fn test_rewrite_files_merging_its_filtered_manifest_keeps_first_row_ids() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = set_table_properties(&catalog, &table, &[(MIN_COUNT_TO_MERGE, "3")]).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 20, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 5, 100);
+        let f4 = make_data_file(&table, "test/4.parquet", 7, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone(), f2]).await;
+        let table = append_files(&catalog, &table, vec![f3]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_manifest_merge(true)
+            .delete_file(f1)
+            .add_file(f4);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let manifests = load_current_manifests(&table).await;
+        let entries = load_current_entries(&table).await;
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].first_row_id, Some(35));
+        for (path, first_row_id) in [
+            ("test/2.parquet", 10),
+            ("test/3.parquet", 30),
+            ("test/4.parquet", 35),
+        ] {
+            let data_file = find_entry_by_path(&entries, path).data_file();
+            assert_eq!(data_file.first_row_id(), Some(first_row_id), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_never_combines_partition_specs() {
+        let catalog = new_memory_catalog().await;
+        let (table, _, _) = spec_evolved_table_with_files(&catalog, FormatVersion::V3).await;
+        let table = set_table_properties(&catalog, &table, &[(MIN_COUNT_TO_MERGE, "2")]).await;
+        let new_2 = make_file_in_spec("test/new-2.parquet", 10, 1, Literal::date(DAY));
+        let new_3 = make_file_in_spec("test/new-3.parquet", 10, 1, Literal::date(DAY));
+        let table = append_files(&catalog, &table, vec![new_2]).await;
+        let manifests_before = load_current_manifests(&table).await;
+
+        let table = append_files_merging_manifests(&catalog, &table, vec![new_3]).await;
+
+        let manifests = load_current_manifests(&table).await;
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].partition_spec_id, 1);
+        assert_eq!(manifests[1], manifests_before[0]);
+        assert_eq!(live_files_by_manifest_spec(&table).await, vec![
+            ("test/new-1.parquet".to_string(), 1),
+            ("test/new-2.parquet".to_string(), 1),
+            ("test/new-3.parquet".to_string(), 1),
+            ("test/old-1.parquet".to_string(), 0),
+            ("test/old-2.parquet".to_string(), 0),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_merge_lists_delete_manifests_untouched() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = set_table_properties(&catalog, &table, &[(MIN_COUNT_TO_MERGE, "2")]).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1]).await;
+        let table = append_files(&catalog, &table, vec![f2]).await;
+        let delete_manifest_path = add_delete_manifest(&table).await;
+        let manifests_before = load_current_manifests(&table).await;
+
+        let table = append_files_merging_manifests(&catalog, &table, vec![f3]).await;
+
+        let manifests = load_current_manifests(&table).await;
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].existing_files_count, Some(2));
+        assert_eq!(manifests[1].manifest_path, delete_manifest_path);
+        assert_eq!(manifests[1], manifests_before[2]);
+    }
+
+    /// Give the table's main branch a retention of its own.
+    async fn set_main_branch_retention(
+        catalog: &impl Catalog,
+        table: &Table,
+    ) -> (Table, SnapshotRetention) {
+        let retention = SnapshotRetention::branch(Some(5), Some(1_000), Some(2_000));
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetSnapshotRef {
+                ref_name: MAIN_BRANCH.to_string(),
+                reference: SnapshotReference::new(
+                    table.metadata().current_snapshot_id().unwrap(),
+                    retention.clone(),
+                ),
+            }])
+            .build();
+        (catalog.update_table(commit).await.unwrap(), retention)
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_keeps_main_branch_retention() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1]).await;
+        let (table, retention) = set_main_branch_retention(&catalog, &table).await;
+
+        let table = append_files(&catalog, &table, vec![f2]).await;
+
+        let main_branch = &table.metadata().refs()[MAIN_BRANCH];
+        assert_eq!(
+            Some(main_branch.snapshot_id),
+            table.metadata().current_snapshot_id()
+        );
+        assert_eq!(main_branch.retention, retention);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_keeps_main_branch_retention() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let (table, retention) = set_main_branch_retention(&catalog, &table).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files().delete_file(f1).add_file(f2);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let main_branch = &table.metadata().refs()[MAIN_BRANCH];
+        assert_eq!(
+            Some(main_branch.snapshot_id),
+            table.metadata().current_snapshot_id()
+        );
+        assert_eq!(main_branch.retention, retention);
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_dates_snapshot_after_a_parent_dated_in_the_future() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1]).await;
+        let first_snapshot = table.metadata().current_snapshot().unwrap();
+        let an_hour_from_now_ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let future_snapshot = Snapshot::builder()
+            .with_snapshot_id(first_snapshot.snapshot_id() ^ 1)
+            .with_parent_snapshot_id(Some(first_snapshot.snapshot_id()))
+            .with_sequence_number(first_snapshot.sequence_number() + 1)
+            .with_timestamp_ms(an_hour_from_now_ms)
+            .with_manifest_list(first_snapshot.manifest_list().to_string())
+            .with_summary(first_snapshot.summary().clone())
+            .with_schema_id(table.metadata().current_schema_id())
+            .build();
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![
+                TableUpdate::AddSnapshot {
+                    snapshot: future_snapshot.clone(),
+                },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: MAIN_BRANCH.to_string(),
+                    reference: SnapshotReference::new(
+                        future_snapshot.snapshot_id(),
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+            ])
+            .build();
+        let table = catalog.update_table(commit).await.unwrap();
+
+        let table = append_files(&catalog, &table, vec![f2]).await;
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.timestamp_ms(), an_hour_from_now_ms + 1);
+    }
+
+    #[tokio::test]
+    async fn test_merge_carries_entry_without_file_sequence_number() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table = set_table_properties(&catalog, &table, &[(MIN_COUNT_TO_MERGE, "2")]).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1]).await;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let output = table
+            .file_io()
+            .new_output(format!(
+                "{}/no-file-sequence-number.avro",
+                table.metadata().metadata_location().unwrap()
+            ))
+            .unwrap();
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            Some(snapshot.snapshot_id()),
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v3_data();
+        writer
+            .add_existing_file(f2, snapshot.snapshot_id(), snapshot.sequence_number(), None)
+            .unwrap();
+        append_to_manifest_list(&table, writer.write_manifest_file().await.unwrap()).await;
+
+        let table = append_files_merging_manifests(&catalog, &table, vec![f3]).await;
+
+        let manifests = load_current_manifests(&table).await;
+        let entries = load_current_entries(&table).await;
+        let carried = find_entry_by_path(&entries, "test/2.parquet");
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(carried.status(), ManifestStatus::Existing);
+        assert_eq!(carried.sequence_number(), Some(snapshot.sequence_number()));
+        assert_eq!(carried.file_sequence_number, None);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_without_duplicate_check_adds_referenced_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone(), f2.clone()]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .delete_file(f1)
+            .add_file(f2);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), [
+            "test/2.parquet",
+            "test/2.parquet"
+        ]);
+    }
+
+    /// Delete the object of `manifest`, so that reading it fails.
+    async fn make_unreadable(table: &Table, manifest: &ManifestFile) {
+        table
+            .file_io()
+            .delete(&manifest.manifest_path)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_leaves_a_manifest_of_another_partition_unread() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let spec_id = table.metadata().default_partition_spec_id();
+        let f1 = make_file_in_spec("test/1.parquet", 10, spec_id, Literal::long(1));
+        let f2 = make_file_in_spec("test/2.parquet", 10, spec_id, Literal::long(2));
+        let f3 = make_file_in_spec("test/3.parquet", 10, spec_id, Literal::long(1));
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let other_partition = load_current_manifests(&table).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let other_partition: Vec<ManifestFile> = load_current_manifests(&table)
+            .await
+            .into_iter()
+            .filter(|manifest| !other_partition.contains(manifest))
+            .collect();
+        make_unreadable(&table, &other_partition[0]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .delete_file(f1)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let manifests = load_current_manifests(&table).await;
+        assert_eq!(other_partition.len(), 1);
+        assert!(manifests.contains(&other_partition[0]));
+        assert_eq!(manifests.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_reads_no_manifest_after_finding_every_removed_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let manifests_before = load_current_manifests(&table).await;
+        let first_manifest = table
+            .manifest_reader()
+            .read(&manifests_before[0])
+            .await
+            .unwrap();
+        let in_first_manifest = if first_manifest.entries()[0].file_path() == f1.file_path() {
+            f1
+        } else {
+            f2
+        };
+        make_unreadable(&table, &manifests_before[1]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .delete_file(in_first_manifest)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let manifests = load_current_manifests(&table).await;
+        assert_eq!(manifests_before.len(), 2);
+        assert!(manifests.contains(&manifests_before[1]));
+        assert!(!manifests.contains(&manifests_before[0]));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_removes_files_of_two_partitions() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let spec_id = table.metadata().default_partition_spec_id();
+        let f1 = make_file_in_spec("test/1.parquet", 10, spec_id, Literal::long(1));
+        let f2 = make_file_in_spec("test/2.parquet", 10, spec_id, Literal::long(2));
+        let f3 = make_file_in_spec("test/3.parquet", 10, spec_id, Literal::long(3));
+        let f4 = make_file_in_spec("test/4.parquet", 20, spec_id, Literal::long(1));
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f3]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file(f1)
+            .delete_file(f2)
+            .add_file(f4);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), [
+            "test/3.parquet",
+            "test/4.parquet"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_removes_a_file_of_the_null_partition() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let spec_id = table.metadata().default_partition_spec_id();
+        let in_null_partition = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::from_iter([None::<Literal>]))
+            .partition_spec_id(spec_id)
+            .build()
+            .unwrap();
+        let f2 = make_file_in_spec("test/2.parquet", 10, spec_id, Literal::long(2));
+        let f3 = make_file_in_spec("test/3.parquet", 10, spec_id, Literal::long(2));
+        let table = append_files(&catalog, &table, vec![in_null_partition.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file(in_null_partition)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), [
+            "test/2.parquet",
+            "test/3.parquet"
+        ]);
+    }
+
+    /// The file among `files` that `manifest` lists.
+    async fn find_file_listed_in(
+        table: &Table,
+        manifest: &ManifestFile,
+        files: &[DataFile],
+    ) -> DataFile {
+        let manifest = table.manifest_reader().read(manifest).await.unwrap();
+        let listed_path = manifest.entries()[0].file_path();
+        files
+            .iter()
+            .find(|file| file.file_path() == listed_path)
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_reads_only_the_manifest_a_removed_file_is_listed_in() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let manifests_before = load_current_manifests(&table).await;
+        let in_last_manifest = find_file_listed_in(&table, &manifests_before[1], &[f1, f2]).await;
+        make_unreadable(&table, &manifests_before[0]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .delete_file_listed_in(in_last_manifest, &manifests_before[1].manifest_path)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let manifests = load_current_manifests(&table).await;
+        assert_eq!(manifests_before.len(), 2);
+        assert!(manifests.contains(&manifests_before[0]));
+        assert!(!manifests.contains(&manifests_before[1]));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_finds_a_removed_file_another_manifest_lists() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let f3 = make_data_file(&table, "test/3.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let table = append_files(&catalog, &table, vec![f2.clone()]).await;
+        let manifests_before = load_current_manifests(&table).await;
+        let in_last_manifest =
+            find_file_listed_in(&table, &manifests_before[1], &[f1, f2.clone()]).await;
+        let removed_path = in_last_manifest.file_path().to_string();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file_listed_in(in_last_manifest, &manifests_before[0].manifest_path)
+            .add_file(f3);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert!(!collect_live_paths(&entries).contains(&removed_path.as_str()));
+        assert_eq!(collect_live_paths(&entries).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_finds_a_removed_file_whose_named_manifest_is_not_listed() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file_listed_in(f1, "test/metadata/no-such-manifest.avro")
+            .add_file(f2);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), ["test/2.parquet"]);
     }
 }
