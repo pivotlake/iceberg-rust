@@ -203,8 +203,9 @@ mod tests {
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
         MAIN_BRANCH, ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus,
-        ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, SnapshotRef,
-        SnapshotReference, SnapshotRetention, Struct, Transform, Type, UnboundPartitionSpec,
+        ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, Snapshot,
+        SnapshotRef, SnapshotReference, SnapshotRetention, Struct, Transform, Type,
+        UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::transaction::tests::{
@@ -1405,5 +1406,47 @@ mod tests {
             table.metadata().current_snapshot_id()
         );
         assert_eq!(main_branch.retention, retention);
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_dates_snapshot_after_a_parent_dated_in_the_future() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1]).await;
+        let first_snapshot = table.metadata().current_snapshot().unwrap();
+        let an_hour_from_now_ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let future_snapshot = Snapshot::builder()
+            .with_snapshot_id(first_snapshot.snapshot_id() ^ 1)
+            .with_parent_snapshot_id(Some(first_snapshot.snapshot_id()))
+            .with_sequence_number(first_snapshot.sequence_number() + 1)
+            .with_timestamp_ms(an_hour_from_now_ms)
+            .with_manifest_list(first_snapshot.manifest_list().to_string())
+            .with_summary(first_snapshot.summary().clone())
+            .with_schema_id(table.metadata().current_schema_id())
+            .build();
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![
+                TableUpdate::AddSnapshot {
+                    snapshot: future_snapshot.clone(),
+                },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: MAIN_BRANCH.to_string(),
+                    reference: SnapshotReference::new(
+                        future_snapshot.snapshot_id(),
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+            ])
+            .build();
+        let table = catalog.update_table(commit).await.unwrap();
+
+        let table = append_files(&catalog, &table, vec![f2]).await;
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.timestamp_ms(), an_hour_from_now_ms + 1);
     }
 }

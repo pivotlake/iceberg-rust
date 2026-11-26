@@ -524,7 +524,14 @@ impl<'a> SnapshotProducer<'a> {
         let writer_next_row_id = manifest_list_writer.next_row_id();
         manifest_list_writer.close().await?;
 
-        let commit_ts = chrono::Utc::now().timestamp_millis();
+        // A snapshot is dated after its parent even when the clock is behind
+        // the one that dated the parent.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let commit_ts = self
+            .table
+            .metadata()
+            .current_snapshot()
+            .map_or(now_ms, |parent| now_ms.max(parent.timestamp_ms() + 1));
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
