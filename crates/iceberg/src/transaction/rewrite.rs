@@ -202,9 +202,9 @@ mod tests {
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
-        ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder,
-        NestedField, Operation, PrimitiveType, Schema, SnapshotRef, Struct, Transform, Type,
-        UnboundPartitionSpec,
+        MAIN_BRANCH, ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, SnapshotRef,
+        SnapshotReference, SnapshotRetention, Struct, Transform, Type, UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::transaction::tests::{
@@ -1345,5 +1345,65 @@ mod tests {
             vec!["ts=2026-08-24+09%3A30%3A00+UTC", "ts_day=2026-08-24"],
             "{summary:?}"
         );
+    }
+
+    /// Give the table's main branch a retention of its own.
+    async fn set_main_branch_retention(
+        catalog: &impl Catalog,
+        table: &Table,
+    ) -> (Table, SnapshotRetention) {
+        let retention = SnapshotRetention::branch(Some(5), Some(1_000), Some(2_000));
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![])
+            .updates(vec![TableUpdate::SetSnapshotRef {
+                ref_name: MAIN_BRANCH.to_string(),
+                reference: SnapshotReference::new(
+                    table.metadata().current_snapshot_id().unwrap(),
+                    retention.clone(),
+                ),
+            }])
+            .build();
+        (catalog.update_table(commit).await.unwrap(), retention)
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_keeps_main_branch_retention() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1]).await;
+        let (table, retention) = set_main_branch_retention(&catalog, &table).await;
+
+        let table = append_files(&catalog, &table, vec![f2]).await;
+
+        let main_branch = &table.metadata().refs()[MAIN_BRANCH];
+        assert_eq!(
+            Some(main_branch.snapshot_id),
+            table.metadata().current_snapshot_id()
+        );
+        assert_eq!(main_branch.retention, retention);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_keeps_main_branch_retention() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let (table, retention) = set_main_branch_retention(&catalog, &table).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx.rewrite_files().delete_file(f1).add_file(f2);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let main_branch = &table.metadata().refs()[MAIN_BRANCH];
+        assert_eq!(
+            Some(main_branch.snapshot_id),
+            table.metadata().current_snapshot_id()
+        );
+        assert_eq!(main_branch.retention, retention);
     }
 }
