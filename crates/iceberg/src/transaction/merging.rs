@@ -276,6 +276,9 @@ pub(crate) struct MergingSnapshotProducer {
     filter_manager: ManifestFilterManager,
     commit_uuid: Uuid,
     data_sequence_number: Option<i64>,
+    /// Whether added files are checked against the files the table already
+    /// references, which reads every data manifest.
+    check_duplicate: bool,
     /// Whether small data manifests are merged, see [`ManifestMergeManager`].
     manifest_merge: bool,
     /// Names the manifests this producer writes. It is never reset, so a
@@ -293,6 +296,7 @@ impl MergingSnapshotProducer {
             filter_manager: ManifestFilterManager::new(true),
             commit_uuid: Uuid::now_v7(),
             data_sequence_number: None,
+            check_duplicate: true,
             manifest_merge: false,
             manifest_counter: AtomicU64::new(0),
         }
@@ -304,6 +308,10 @@ impl MergingSnapshotProducer {
 
     pub(crate) fn set_data_sequence_number(&mut self, sequence_number: i64) {
         self.data_sequence_number = Some(sequence_number);
+    }
+
+    pub(crate) fn set_check_duplicate(&mut self, check_duplicate: bool) {
+        self.check_duplicate = check_duplicate;
     }
 
     pub(crate) fn set_manifest_merge(&mut self, manifest_merge: bool) {
@@ -353,7 +361,9 @@ impl MergingSnapshotProducer {
             self.added_data_files.clone(),
         );
         snapshot_producer.validate_added_data_files()?;
-        snapshot_producer.validate_duplicate_files().await?;
+        if self.check_duplicate {
+            snapshot_producer.validate_duplicate_files().await?;
+        }
         let snapshot_id = snapshot_producer.snapshot_id;
 
         // 1. Load existing manifests from the current snapshot.

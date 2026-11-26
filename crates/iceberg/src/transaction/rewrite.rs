@@ -114,6 +114,13 @@ impl RewriteFilesAction {
         self
     }
 
+    /// Set whether to check that no added file is already referenced by the
+    /// table, which reads every data manifest. On by default.
+    pub fn with_check_duplicate(mut self, v: bool) -> Self {
+        self.producer.set_check_duplicate(v);
+        self
+    }
+
     /// Set whether to merge small data manifests while committing. Off by
     /// default: the rewrite then lists the manifests it did not touch as they
     /// are.
@@ -1647,5 +1654,28 @@ mod tests {
         assert_eq!(carried.status(), ManifestStatus::Existing);
         assert_eq!(carried.sequence_number(), Some(snapshot.sequence_number()));
         assert_eq!(carried.file_sequence_number, None);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_without_duplicate_check_adds_referenced_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone(), f2.clone()]).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .delete_file(f1)
+            .add_file(f2);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let entries = load_current_entries(&table).await;
+        assert_eq!(collect_live_paths(&entries), [
+            "test/2.parquet",
+            "test/2.parquet"
+        ]);
     }
 }
